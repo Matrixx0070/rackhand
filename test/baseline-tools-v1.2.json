@@ -1,0 +1,263 @@
+[
+  {
+    "name": "bash",
+    "description": "Run a shell command on a host: the remote twin of the local Bash tool. stdout and stderr come back merged, in order; a non-zero exit adds an [exit code: N] line. Working directory: pass `cwd`, or pass the same `session` name on every call to make `cd` persist between calls; with neither, each call starts in the home directory. Output over ~100 KB is cut in the middle and kept in full in a file on the host (read it with `read`). Use run_in_background for long jobs, then ssh_job.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "Host name from list_hosts"
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Shell command (bash)"
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 1800000,
+          "default": 120000,
+          "description": "Milliseconds before the command is killed (default 120000, max 1800000)"
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Directory to run in: absolute, or relative to the session directory"
+        },
+        "session": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]{1,64}$",
+          "description": "Any name; calls that share it share a working directory that `cd` changes. Use one per conversation"
+        },
+        "run_in_background": {
+          "type": "boolean",
+          "default": false,
+          "description": "Start it as a background job and return a jobId at once"
+        },
+        "description": {
+          "type": "string",
+          "description": "What the command does (for the transcript; not used by the server)"
+        }
+      },
+      "required": [
+        "host",
+        "command"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "bridge",
+    "description": "Open a direct path from your own sandbox shell to this server, so files and command output move at network speed without passing through the model. Returns a time-limited URL and a one-line installer for the `box` command (exec, put, get, push, pull, call). Use it for bulk transfers, whole directories, binaries, and scripted sequences of commands.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "ttl_hours": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 168,
+          "default": 12,
+          "description": "How long the URL stays valid"
+        }
+      },
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "edit",
+    "description": "Replace exact text in files on a host: the remote twin of the local Edit tool, and bulk-capable. old_string must match exactly and be unique in the file unless replace_all is set. Pass file_path/old_string/new_string for one edit, or `edits` for up to 50 edits across files in one call: edits to the same file apply in order, and a file is written only if all of its edits succeed.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "Host name from list_hosts"
+        },
+        "file_path": {
+          "type": "string",
+          "description": "Absolute path of the file to change"
+        },
+        "old_string": {
+          "type": "string",
+          "description": "Exact text to replace"
+        },
+        "new_string": {
+          "type": "string",
+          "description": "Text to put in its place"
+        },
+        "replace_all": {
+          "type": "boolean",
+          "description": "Replace every occurrence instead of requiring a unique match"
+        },
+        "edits": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "file_path": {
+                "type": "string",
+                "description": "Absolute path"
+              },
+              "old_string": {
+                "type": "string"
+              },
+              "new_string": {
+                "type": "string"
+              },
+              "replace_all": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "file_path",
+              "old_string",
+              "new_string"
+            ],
+            "additionalProperties": false
+          },
+          "minItems": 1,
+          "maxItems": 50,
+          "description": "Several edits in one call"
+        }
+      },
+      "required": [
+        "host"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "read",
+    "description": "Read files on a host: the remote twin of the local Read tool, and bulk-capable. Text comes back as numbered lines (cat -n style); use offset/limit for long files. Images (png, jpg, gif, webp) come back as images. Pass file_path for one file, or `files` for up to 20 files read in one call.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "Host name from list_hosts"
+        },
+        "file_path": {
+          "type": "string",
+          "description": "Absolute path of the file to read"
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "First line to return (1-based)"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20000,
+          "description": "Number of lines to return (default 2000)"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "file_path": {
+                "type": "string",
+                "description": "Absolute path"
+              },
+              "offset": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20000
+              }
+            },
+            "required": [
+              "file_path"
+            ],
+            "additionalProperties": false
+          },
+          "minItems": 1,
+          "maxItems": 20,
+          "description": "Several files in one call; they share the output budget"
+        }
+      },
+      "required": [
+        "host"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "write",
+    "description": "Create or overwrite files on a host: the remote twin of the local Write tool, and bulk-capable. Pass file_path + content for one file, or `files` for up to 50 files written in parallel in one call. Parent directories are created; an existing file keeps its mode and owner. For large or binary files use the bridge instead.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "Host name from list_hosts"
+        },
+        "file_path": {
+          "type": "string",
+          "description": "Absolute path of the file to write"
+        },
+        "content": {
+          "type": "string",
+          "description": "Full new content of the file"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "file_path": {
+                "type": "string",
+                "description": "Absolute path"
+              },
+              "content": {
+                "type": "string"
+              },
+              "mode": {
+                "type": "string",
+                "pattern": "^[0-7]{3,4}$",
+                "description": "Octal, e.g. 0644"
+              }
+            },
+            "required": [
+              "file_path",
+              "content"
+            ],
+            "additionalProperties": false
+          },
+          "minItems": 1,
+          "maxItems": 50,
+          "description": "Several files in one call"
+        }
+      },
+      "required": [
+        "host"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  }
+]

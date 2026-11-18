@@ -1,0 +1,234 @@
+# ssh-mcp
+
+A remote [MCP](https://modelcontextprotocol.io) server that gives an AI assistant a real shell and real files on **your own
+VPS**, and on any other machine that VPS can reach over SSH.
+
+```
+AI client (Claude, ChatGPT, Kimi, Cursor, your own agent)
+        │  HTTPS, one secret URL
+        ▼
+ssh-mcp on your VPS ──SSH/SFTP──▶ any host in hosts.json
+```
+
+> **Read this first.** The connector URL contains a secret, and that secret is the only authentication.
+> **Whoever has the URL has a root shell on the machine**, and on every host listed in `hosts.json`.
+> Treat it like a root password: do not paste it into chats, issues, screenshots or logs.
+> On AWS EC2, anyone with the URL can also use the instance's IAM role - check what that role allows
+> before you install (see [Security](#security)).
+
+16 tools, one install command, no account, no database. Version 1.3.0.
+
+## Quick start
+
+On a fresh Linux VPS (x86-64 or arm64, systemd, public IP, ports **80** and **443** open), as root:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Matrixx0070/ssh-mcp/main/install.sh | sudo bash
+```
+
+The installer:
+
+1. installs Node.js 22 if Node 20+ is missing,
+2. puts the server in `/opt/ssh-mcp`,
+3. writes a random secret to `/etc/ssh-mcp.env`,
+4. starts the systemd service `ssh-mcp` (it listens on `127.0.0.1` only),
+5. puts [Caddy](https://caddyserver.com) in front of it with an automatic HTTPS certificate for
+   `https://<your-ip-with-dashes>.sslip.io` (no domain needed),
+6. checks that the server answers and prints your connector URL:
+
+```
+https://203-0-113-10.sslip.io/mcp/<64 hex characters>
+```
+
+Options (environment variables in front of `bash`): `DOMAIN=mcp.example.com` to use your own domain,
+`NO_CADDY=1` if you already run a reverse proxy, `PUBLIC_IP=...` to skip the IP lookup. The top of
+[`install.sh`](install.sh) lists all of them. If something already listens on port 443, the installer leaves it
+alone and tells you which proxy rule to add.
+
+Run the same command again to **upgrade**: `hosts.json` and the secret are kept, the old `server.ts` is backed up,
+and it is put back automatically if the new one does not answer.
+
+## Connect your AI client
+
+The server speaks standard MCP over Streamable HTTP, so any client that supports remote MCP servers works.
+Menus move around; the names below are the ones in use when this was written.
+
+| Client | How |
+|---|---|
+| **Claude** (web, desktop, mobile) | Settings → Connectors → *Add custom connector* → paste the URL |
+| **Claude Code** | `claude mcp add --transport http vps <URL>` |
+| **ChatGPT** | Settings → Apps & Connectors → Advanced → turn on *Developer mode*, add a connector with the URL, authentication: *No authentication*. Which plans may use write-capable custom connectors is decided by OpenAI and has changed over time. |
+| **Kimi Code CLI** | `kimi mcp add --transport http vps <URL>` |
+| **Cursor, VS Code, Gemini CLI, others** | a remote/HTTP MCP server entry, e.g. `{"mcpServers": {"vps": {"url": "<URL>"}}}` |
+| **Your own agent** | any MCP SDK: Streamable HTTP client pointed at the URL |
+
+Then ask the assistant something like *"run `uname -a` on my VPS"*.
+
+## Tools
+
+Every tool takes `host`: a name from `list_hosts`. `local` is the VPS the server runs on; every other host is
+reached over SSH and behaves the same way.
+
+### Fewer round trips
+
+Every tool call from a model costs seconds (round trip + thinking); the work on the host takes milliseconds.
+So the fastest way to work is to put more into one call.
+
+| Tool | Input | What it does |
+|---|---|---|
+| `batch` | `ops[]` (max 30), `stop_on_error` (true), `cwd`, `session` | Runs several steps in ONE call, in order. Each op is exactly one of `{bash}`, `{read}`, `{write}`, `{edit}` with the arguments of that tool (without `host`). Stops at the first failure (non-zero exit, timeout, failed edit, missing file) and skips the rest, unless `stop_on_error` is false. A `cd` in one bash op carries to the later bash ops of the batch. The ops share the ~100 KB output budget; whatever is cut stays in a file on the host. |
+
+```json
+{"host": "local", "cwd": "/app", "ops": [
+  {"write": {"file_path": "/app/a.ts", "content": "..."}},
+  {"edit":  {"file_path": "/app/b.ts", "old_string": "x", "new_string": "y"}},
+  {"bash":  {"command": "npm test", "quiet": true}},
+  {"read":  {"file_path": "/app/out.log", "limit": 50}}
+]}
+```
+
+```
+=== [1/4] write /app/a.ts | ok | 0.00s ===
+Wrote 12 bytes to local:/app/a.ts
+=== [2/4] edit /app/b.ts | ok | 0.00s ===
+...
+=== [3/4] bash npm test | FAILED | 4.20s ===
+...
+[exit code: 1]
+=== [4/4] read /app/out.log | skipped ===
+=== batch: 2 ok, 1 failed, 1 skipped | 4.21s ===
+```
+
+The server also sends short **instructions** at `initialize` (the `INSTRUCTIONS` constant in `server.ts`) that point
+any model at `batch`, the `files` / `edits` arrays, `ssh_exec_many`, `quiet` and background jobs.
+
+### Shell and files
+
+Same parameter names as the Bash / Read / Write / Edit tools many coding agents already know.
+
+| Tool | Input | What it does |
+|---|---|---|
+| `bash` | `command`, `timeout` (ms, 120000, max 1800000), `cwd`, `session`, `run_in_background`, `quiet` | Runs a command. stdout+stderr merged in order; a failure adds `[exit code: N]`, a timeout `[timed out after Ns - exit code: 124]`. Starts in the home directory unless `cwd` is given. Calls sharing a `session` name share a working directory that `cd` changes. Output over ~100 KB is cut in the middle and kept in full in a file on the host. `quiet` returns only the end of the output (last ~2 KB, ~8 KB after a failure). `run_in_background` returns a `jobId` (follow with `ssh_job`). |
+| `read` | `file_path`, `offset`, `limit` (2000) - or `files[]` (max 20) | Text as numbered lines (`cat -n` style); lines over 2000 chars are cut. Images (png, jpg, gif, webp, up to 4 MB) come back as images. One bad file does not fail the rest. |
+| `write` | `file_path` + `content` - or `files[]` of `{file_path, content, mode}` (max 50) | Creates or overwrites files, in parallel, over one connection. Parent directories are created. |
+| `edit` | `file_path`, `old_string`, `new_string`, `replace_all` - or `edits[]` (max 50) | Exact text replacement; `old_string` must be unique unless `replace_all`. Edits to one file apply in order and the file is written only if all of them succeed. |
+
+### Commands, jobs, code
+
+| Tool | Input | What it does |
+|---|---|---|
+| `ssh_exec` | `command`, `timeout_sec` (120, max 1800) | Runs a command; returns `exit`, stdout and stderr separately. |
+| `ssh_exec_many` | `commands[]` of `{id, command, timeout_sec}` (max 10) | Runs them concurrently; one block per id with exit code, stdout, stderr, duration. |
+| `ssh_spawn` | `command` | Starts the command in the background and returns a `jobId` at once. |
+| `ssh_job` | `jobId`, `action`: `status` \| `tail` \| `wait` \| `kill` | Job state, end of the log, block until exit, or stop it. |
+| `ssh_jobs` | `limit` (50) | Lists jobs newest first: `running`, `exited` (with code) or `lost`. |
+| `exec_code` | `language`: `python` \| `node` \| `bash`, `code`, `timeout_sec` | Writes the code to a temp file, runs it, returns exit, stdout, stderr. |
+| `list_hosts` | - | Lists the hosts in `hosts.json`. |
+| `sftp_read` / `sftp_write` / `sftp_list` | `path`, ... | Plain file read (utf8/base64), write and directory listing. |
+| `bridge` | `ttl_hours` (12, max 168) | Returns a time-limited URL and a one-line installer for the `box` command (below). |
+
+Which one to use: `batch` for anything with more than one step; `bash` / `read` / `write` / `edit` for single steps;
+`ssh_exec_many` for several independent commands; `run_in_background` + `ssh_job` for anything long; the bridge for
+big, binary or many files.
+
+## More hosts
+
+`/opt/ssh-mcp/hosts.json` (see [`hosts.example.json`](hosts.example.json)) lists what the server may reach. It is read
+on every call, so no restart is needed.
+
+```bash
+ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519               # the connector's key (once)
+ssh-copy-id -i /root/.ssh/id_ed25519.pub deploy@203.0.113.10        # per target host
+ssh-keyscan -t ed25519 203.0.113.10 2>/dev/null | ssh-keygen -lf -  # -> SHA256:... for hostFingerprint
+```
+
+```json
+{
+  "local": { "local": true },
+  "web-1": { "host": "203.0.113.10", "username": "deploy", "privateKeyPath": "/root/.ssh/id_ed25519",
+             "hostFingerprint": "SHA256:..." }
+}
+```
+
+Use keys. If a key has a passphrase, put it in an environment variable in `/etc/ssh-mcp.env` and name that variable
+in `passphraseEnv`; never put a secret in `hosts.json` itself.
+
+## The bridge and the `box` command
+
+For an assistant that has its own sandbox shell: `bridge` returns `https://<host>/b/<token>`, and from that shell
+
+```bash
+curl -fsS '<url>/cli' -o /tmp/box && bash /tmp/box install
+
+box exec [-t SEC] [-C DIR] [HOST] -- 'command'   # merged output of any size, same exit code; "-" reads a script from stdin
+box put  ./file [HOST:]/remote/path [MODE]       # one file, any size, binary-safe, all-or-nothing
+box get  [HOST:]/remote/path [./file|-]
+box push ./dir [HOST:]/remote/dir [-x PATTERN]   # whole tree as one tar.gz stream
+box pull [HOST:]/remote/dir ./dir [-x PATTERN]
+box call TOOL '{json}'                           # any of the 16 tools
+box tools
+```
+
+Each command is one HTTPS request that does not pass through the model, so a script can do dozens of operations
+in one tool call and run several at once with `&` or `xargs -P`. For scale, on one small cloud VM: 50 MB up in
+about 8 s, a 4,300-file tree in under 4 s, one command in about 0.6 s.
+
+- An upload is renamed over its target only when every byte arrived; an existing file keeps its mode and owner.
+- A dropped connection stops the transfer on the host.
+- The token is `<expiry>.<HMAC of expiry with MCP_SECRET>`: no state, valid until it expires, and it cannot mint
+  another one. **It grants the same access as the connector URL.** The only way to revoke one early is a new secret.
+
+## Operating it
+
+| | |
+|---|---|
+| Logs | `journalctl -u ssh-mcp -f` |
+| Restart | `systemctl restart ssh-mcp` (cuts calls in flight for about 2 seconds) |
+| New secret | `rm /etc/ssh-mcp.env`, run the installer again, re-add the connector with the new URL |
+| Upgrade | run the installer again |
+| Uninstall | `systemctl disable --now ssh-mcp && rm -rf /opt/ssh-mcp /etc/ssh-mcp.env /etc/systemd/system/ssh-mcp.service /var/lib/ssh-mcp`, then remove the `# ssh-mcp` block from `/etc/caddy/Caddyfile` |
+
+The service runs with `KillMode=process` and `OOMPolicy=continue`: restarting, crashing or an out-of-memory kill of
+the connector does not take down the programs that were started through it.
+
+State on the host: `/var/lib/ssh-mcp/jobs` (background job logs, not pruned), `/var/lib/ssh-mcp/sessions` (one
+remembered working directory per `bash` session), `/var/lib/ssh-mcp/out` (full copies of oversized output, deleted
+after 3 days).
+
+For a careful upgrade of a busy server there is [`upgrade/deploy.sh`](upgrade/deploy.sh): it swaps in
+`/opt/ssh-mcp/server.new.ts`, checks the tool list, runs a real `batch` call and the bridge, and rolls back by itself.
+[`upgrade/rehearse.sh`](upgrade/rehearse.sh) rehearses that on a throwaway copy of the service first.
+
+## Security
+
+- **The URL is the key.** There is no login, no per-user permission and no allow-list of commands. Anything that
+  can call the URL can run anything as the user the service runs as, which is **root** by default.
+- The server binds to `127.0.0.1`; the reverse proxy is the only public entry, and only over HTTPS.
+- Every host in `hosts.json` is fully reachable by anything that can call the connector. Keep the list short and
+  prefer a non-root `username` on the targets.
+- **Cloud credentials on the machine are in reach too.** On AWS EC2 the instance's IAM role can be used by anyone
+  with a shell, so anyone with the URL has that role's permissions. The installer prints a warning when it finds a
+  role. Give the instance no role, or one with only the permissions the machine itself needs.
+- An AI model decides which commands to run. Review what it does, keep backups, and do not point it at a machine
+  whose loss you cannot afford.
+- Optional hardening: restrict the proxy to your AI provider's published outbound IP ranges, use your own domain,
+  rotate the secret, run the service as a less privileged user.
+
+Found a security problem? Please report it privately (GitHub: Security → Report a vulnerability) rather than in a public issue.
+
+## Development
+
+```bash
+npm ci
+npm run typecheck
+npm test          # 115 black-box tests over the HTTP endpoint, against "local" and an in-process SSH server
+```
+
+The whole server is one file, [`server.ts`](server.ts), run with `tsx`; [`box.sh`](box.sh) is the bridge client the
+server hands out. Configuration is by environment variable: `MCP_SECRET` (required, 32+ characters), `PORT` (8787),
+`HOSTS_FILE` (`./hosts.json`), `JOBS_DIR` (`/var/lib/ssh-mcp/jobs`), `PUBLIC_URL` (only if the proxy does not send
+`X-Forwarded-Host`).
+
+## License
+
+[MIT](LICENSE)

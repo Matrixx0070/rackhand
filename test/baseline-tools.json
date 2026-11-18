@@ -1,0 +1,346 @@
+[
+  {
+    "name": "exec_code",
+    "description": "Write a code snippet to a temp file on a host and run it with python3, node or bash. Returns exit code, stdout, stderr.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "Host name from list_hosts"
+        },
+        "language": {
+          "type": "string",
+          "enum": [
+            "python",
+            "node",
+            "bash"
+          ]
+        },
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Source code to run"
+        },
+        "timeout_sec": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1800,
+          "default": 120
+        }
+      },
+      "required": [
+        "host",
+        "language",
+        "code"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_hosts",
+    "description": "List SSH hosts this connector can reach.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {}
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "sftp_list",
+    "description": "List a directory on a host.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string",
+          "default": "."
+        }
+      },
+      "required": [
+        "host"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "sftp_read",
+    "description": "Read a file from a host (utf8 text, or base64 for binary).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "encoding": {
+          "type": "string",
+          "enum": [
+            "utf8",
+            "base64"
+          ],
+          "default": "utf8"
+        }
+      },
+      "required": [
+        "host",
+        "path"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "sftp_write",
+    "description": "Write a file on a host (overwrites).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        },
+        "encoding": {
+          "type": "string",
+          "enum": [
+            "utf8",
+            "base64"
+          ],
+          "default": "utf8"
+        },
+        "mode": {
+          "type": "string",
+          "pattern": "^[0-7]{3,4}$",
+          "description": "Octal, e.g. 0644"
+        }
+      },
+      "required": [
+        "host",
+        "path",
+        "content"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "ssh_exec",
+    "description": "Run a shell command on a named host. Returns exit code, stdout, stderr.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "Host name from list_hosts"
+        },
+        "command": {
+          "type": "string",
+          "description": "Shell command to run"
+        },
+        "timeout_sec": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1800,
+          "default": 120
+        }
+      },
+      "required": [
+        "host",
+        "command"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "ssh_exec_many",
+    "description": "Run up to 10 shell commands concurrently on one host. Returns one block per id: exit code, stdout, stderr, duration.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "Host name from list_hosts"
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[^\\r\\n]+$",
+                "description": "Your label for this command; echoed in its result block"
+              },
+              "command": {
+                "type": "string",
+                "description": "Shell command to run"
+              },
+              "timeout_sec": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1800,
+                "default": 120
+              }
+            },
+            "required": [
+              "id",
+              "command"
+            ],
+            "additionalProperties": false
+          },
+          "minItems": 1,
+          "maxItems": 10,
+          "description": "1-10 commands, run in parallel"
+        }
+      },
+      "required": [
+        "host",
+        "commands"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "ssh_job",
+    "description": "Inspect or control a background job started with ssh_spawn. status: state (running | exited | lost) and exit code. tail: status plus the last `bytes` of the log. wait: block until the job exits or timeout_sec passes, then status plus log tail. kill: SIGTERM the job's process group, SIGKILL after 5s.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "Host the job was started on"
+        },
+        "jobId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+          "description": "jobId returned by ssh_spawn"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "status",
+            "tail",
+            "wait",
+            "kill"
+          ]
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000,
+          "default": 8192,
+          "description": "tail/wait: how many bytes of the log end to return"
+        },
+        "timeout_sec": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1800,
+          "default": 60,
+          "description": "wait: maximum seconds to block"
+        }
+      },
+      "required": [
+        "host",
+        "jobId",
+        "action"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "ssh_jobs",
+    "description": "List background jobs on a host, newest first: jobId, state (running | exited | lost), exit code, elapsed time, start time, command.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "Host name from list_hosts"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 50,
+          "description": "Show at most this many jobs"
+        }
+      },
+      "required": [
+        "host"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "ssh_spawn",
+    "description": "Start a long-running shell command in the background on a host (bash under setsid/nohup) and return a jobId immediately. Output goes to /var/lib/ssh-mcp/jobs/<jobId>.log and the exit code to <jobId>.exit. Follow up with ssh_job (status | tail | wait | kill) or ssh_jobs.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "Host name from list_hosts"
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Shell command (bash) to run in the background"
+        }
+      },
+      "required": [
+        "host",
+        "command"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  }
+]

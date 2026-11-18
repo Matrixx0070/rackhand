@@ -1,0 +1,8 @@
+node_modules/
+hosts.json
+*.log
+*.env
+.env*
+server.new.ts
+server.ts.bak-*
+*.tap

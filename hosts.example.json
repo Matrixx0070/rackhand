@@ -1,0 +1,17 @@
+{
+  "local": { "local": true },
+  "web-1": {
+    "host": "203.0.113.10",
+    "port": 22,
+    "username": "root",
+    "privateKeyPath": "/root/.ssh/id_ed25519",
+    "hostFingerprint": "SHA256:REPLACE_WITH_ssh-keyscan_FINGERPRINT"
+  },
+  "client-vps": {
+    "host": "198.51.100.25",
+    "port": 2222,
+    "username": "deploy",
+    "privateKeyPath": "/root/.ssh/client_vps_ed25519",
+    "passphraseEnv": "CLIENT_VPS_KEY_PASS"
+  }
+}

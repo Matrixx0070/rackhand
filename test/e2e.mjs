@@ -1,0 +1,1142 @@
+// Black-box tests over the MCP HTTP endpoint (JSON-RPC), against a real server process.
+// Hosts under test: "local" (child_process path) and "remote" (ssh2 path, via an in-process
+// SSH server that runs commands with `sh -c`, i.e. a non-bash login shell).
+// Run: node --test test/e2e.mjs      (SERVER_FILE=server.ts by default)
+import { test, before, after } from "node:test";
+import assert from "node:assert/strict";
+import { spawn, execFile, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
+import { appendFileSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, existsSync, statSync, lstatSync, chmodSync,
+  openSync, readSync, writeSync, fstatSync, fchmodSync, closeSync } from "node:fs";
+import { createHash, createHmac, randomBytes } from "node:crypto";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import http from "node:http";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { Server, utils } = require("ssh2");
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const SERVER_FILE = process.env.SERVER_FILE ?? "server.ts";
+const TMP = mkdtempSync(path.join(tmpdir(), "ssh-mcp-test-"));
+const JOBS = path.join(TMP, "jobs");
+const CODE_TMP = path.join(TMP, "codetmp");
+const HOME2 = path.join(TMP, "home");
+mkdirSync(CODE_TMP);
+mkdirSync(HOME2);
+const SECRET = randomBytes(32).toString("hex");
+const PORT = 18787, PORT2 = 18788;
+const BASE = `http://127.0.0.1:${PORT}/mcp/${SECRET}`;
+const BASE2 = `http://127.0.0.1:${PORT2}/mcp/${SECRET}`;
+const OLD = ["list_hosts", "ssh_exec", "sftp_read", "sftp_write", "sftp_list", "ssh_exec_many", "ssh_spawn", "ssh_job", "ssh_jobs", "exec_code"]; // v1.0 + v1.1, as deployed
+const NEW = ["bash", "read", "write", "edit", "bridge"]; // v1.2
+const V13 = ["batch"]; // v1.3
+const HOSTS = ["local", "remote"];
+const MAX_OUT = 100_000;
+const SERVER_LOG = path.join(tmpdir(), `ssh-mcp-e2e-server-${process.getuid?.() ?? 0}.log`); // stdout+stderr of the servers under test (one per user)
+writeFileSync(SERVER_LOG, "");
+
+let sshd, servers = [];
+
+function startSshd() {
+  const host = utils.generateKeyPairSync("ed25519");
+  const client = utils.generateKeyPairSync("ed25519");
+  writeFileSync(path.join(TMP, "client"), client.private, { mode: 0o600 });
+  const fp = "SHA256:" + createHash("sha256").update(utils.parseKey(host.private).getPublicSSH()).digest("base64").replace(/=+$/, "");
+  const srv = new Server({ hostKeys: [host.private] }, (c) => {
+    const kids = new Set();
+    c.on("authentication", (ctx) => (ctx.method === "publickey" ? ctx.accept() : ctx.reject(["publickey"])));
+    c.on("ready", () => c.on("session", (accept) => {
+      const session = accept();
+      session.on("exec", (acc, _rej, info) => {
+        const stream = acc();
+        // Like sshd: run through the login shell (dash here), finish when the process is gone AND its pipes are closed.
+        const child = spawn("sh", ["-c", info.command], { env: { ...process.env, TMPDIR: CODE_TMP }, stdio: ["pipe", "pipe", "pipe"] });
+        kids.add(child);
+        stream.pipe(child.stdin);                      // stdin: EOF only when the client ends the channel
+        child.stdin.on("error", () => {});
+        child.stdout.on("data", (d) => { if (stream.write(d) === false) { child.stdout.pause(); stream.once("drain", () => child.stdout.resume()); } });
+        child.stderr.on("data", (d) => stream.stderr.write(d));
+        child.on("close", (code) => { kids.delete(child); stream.exit(code ?? 255); stream.end(); });
+      });
+      session.on("sftp", (acc) => serveSftp(acc()));
+    }));
+    c.on("close", () => { for (const k of kids) { k.stdin.destroy(); k.stdout.destroy(); k.stderr.destroy(); k.kill("SIGKILL"); } }); // like sshd: the session's pipes close
+    c.on("error", () => {});
+  });
+  return new Promise((res) => srv.listen(0, "127.0.0.1", () => res({ srv, port: srv.address().port, fp })));
+}
+
+// Minimal SFTP subsystem backed by the local filesystem, enough for ssh2's readFile/writeFile/readdir.
+function serveSftp(sftp) {
+  const { STATUS_CODE, flagsToString } = utils.sftp;
+  const handles = new Map(); let next = 0;
+  const put = (v) => { const b = Buffer.alloc(4); b.writeUInt32BE(next); handles.set(next++, v); return b; };
+  const get = (h) => handles.get(h.readUInt32BE(0));
+  const fail = (id, e) => sftp.status(id, e?.code === "ENOENT" ? STATUS_CODE.NO_SUCH_FILE : e?.code === "EACCES" ? STATUS_CODE.PERMISSION_DENIED : STATUS_CODE.FAILURE, e?.message);
+  const attrs = (st) => ({ mode: st.mode, uid: st.uid, gid: st.gid, size: st.size, atime: Math.floor(st.atimeMs / 1000), mtime: Math.floor(st.mtimeMs / 1000) });
+  const guard = (fn) => (id, ...a) => { try { fn(id, ...a); } catch (e) { fail(id, e); } };
+  sftp.on("OPEN", guard((id, file, flags, a) => sftp.handle(id, put({ fd: openSync(file, flagsToString(flags) ?? "r", a?.mode ?? 0o666) }))));
+  sftp.on("READ", guard((id, h, off, len) => { const buf = Buffer.alloc(len); const n = readSync(get(h).fd, buf, 0, len, off); n ? sftp.data(id, buf.subarray(0, n)) : sftp.status(id, STATUS_CODE.EOF); }));
+  sftp.on("WRITE", guard((id, h, off, data) => { writeSync(get(h).fd, data, 0, data.length, off); sftp.status(id, STATUS_CODE.OK); }));
+  sftp.on("FSTAT", guard((id, h) => sftp.attrs(id, attrs(fstatSync(get(h).fd)))));
+  sftp.on("FSETSTAT", guard((id, h, a) => { if (a.mode !== undefined) fchmodSync(get(h).fd, a.mode & 0o7777); sftp.status(id, STATUS_CODE.OK); }));
+  sftp.on("SETSTAT", guard((id, p, a) => { if (a.mode !== undefined) chmodSync(p, a.mode & 0o7777); sftp.status(id, STATUS_CODE.OK); }));
+  sftp.on("STAT", guard((id, p) => sftp.attrs(id, attrs(statSync(p)))));
+  sftp.on("LSTAT", guard((id, p) => sftp.attrs(id, attrs(lstatSync(p)))));
+  sftp.on("OPENDIR", guard((id, p) => sftp.handle(id, put({ dir: p, list: readdirSync(p), done: false }))));
+  sftp.on("READDIR", guard((id, h) => {
+    const d = get(h);
+    if (d.done || d.list.length === 0) return sftp.status(id, STATUS_CODE.EOF);
+    d.done = true;
+    sftp.name(id, d.list.map((f) => { const st = lstatSync(path.join(d.dir, f)); return { filename: f, longname: `${st.isDirectory() ? "d" : "-"}rwxr-xr-x 1 ${st.uid} ${st.gid} ${st.size} Jan  1 00:00 ${f}`, attrs: attrs(st) }; }));
+  }));
+  sftp.on("CLOSE", guard((id, h) => { const v = get(h); if (v?.fd !== undefined) closeSync(v.fd); handles.delete(h.readUInt32BE(0)); sftp.status(id, STATUS_CODE.OK); }));
+  sftp.on("MKDIR", guard((id, p, a) => { mkdirSync(p, a?.mode ?? 0o777); sftp.status(id, STATUS_CODE.OK); }));
+  sftp.on("REALPATH", guard((id, p) => sftp.name(id, [{ filename: path.resolve(p), longname: path.resolve(p), attrs: {} }])));
+}
+
+function startServer(port, env = {}) {
+  const p = spawn(process.execPath, ["--import", "tsx", path.join(ROOT, SERVER_FILE)], {
+    cwd: ROOT,
+    env: { ...process.env, PORT: String(port), MCP_SECRET: SECRET, HOSTS_FILE: path.join(TMP, "hosts.json"), JOBS_DIR: JOBS, TMPDIR: CODE_TMP, ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  servers.push(p);
+  return new Promise((res, rej) => {
+    let out = "";
+    const t = setTimeout(() => rej(new Error("server did not start:\n" + out)), 30_000);
+    const on = (d) => { out += d; appendFileSync(SERVER_LOG, d); if (out.includes("listening")) { clearTimeout(t); res(p); } };
+    p.stdout.on("data", on);
+    p.stderr.on("data", on);
+    p.on("exit", (c) => { clearTimeout(t); rej(new Error(`server exited ${c}:\n${out}`)); });
+  });
+}
+
+let nextId = 1;
+async function rpc(base, method, params) {
+  const res = await fetch(base, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: nextId++, method, params }),
+  });
+  const body = await res.text();
+  if (res.status !== 200) return { status: res.status, json: null };
+  const json = (res.headers.get("content-type") ?? "").includes("text/event-stream")
+    ? JSON.parse(body.split("\n").filter((l) => l.startsWith("data: ")).pop().slice(6))
+    : JSON.parse(body);
+  return { status: res.status, json };
+}
+async function call(name, args, base = BASE) {
+  const { json } = await rpc(base, "tools/call", { name, arguments: args });
+  if (json.error) return { isError: true, text: json.error.message };
+  return { isError: !!json.result.isError, text: json.result.content.filter((c) => c.type === "text").map((c) => c.text).join("") };
+}
+const field = (text, key) => (text.match(new RegExp(`^${key}: (.*)$`, "m")) ?? [])[1];
+const logPart = (text) => text.slice(text.indexOf(" ---\n", text.indexOf("--- log (last ")) + 5);
+const pgrep = (pat) => { try { return execFileSync("pgrep", ["-f", pat]).toString().trim(); } catch { return ""; } }; // no shell: pattern must not match our own helper
+const pkill9 = (pat) => { try { execFileSync("pkill", ["-9", "-f", pat]); } catch {} };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function spawnJob(host, command, base = BASE) {
+  const s = await call("ssh_spawn", { host, command }, base);
+  assert.equal(s.isError, false, s.text);
+  const jobId = field(s.text, "jobId");
+  assert.match(jobId, /^\d{8}-\d{6}-[0-9a-f]{6}$/, s.text);
+  return { jobId, text: s.text };
+}
+const job = (host, jobId, action, extra = {}, base = BASE) => call("ssh_job", { host, jobId, action, ...extra }, base);
+
+before(async () => {
+  sshd = await startSshd();
+  writeFileSync(path.join(TMP, "hosts.json"), JSON.stringify({
+    local: { local: true },
+    remote: { host: "127.0.0.1", port: sshd.port, username: "t", privateKeyPath: path.join(TMP, "client"), hostFingerprint: sshd.fp },
+  }));
+  await startServer(PORT);
+  await startServer(PORT2, { JOBS_DIR: "/proc/nope/jobs", HOME: HOME2 });
+});
+after(() => {
+  for (const p of servers) p.kill("SIGKILL");
+  sshd.srv.close();
+  for (const n of ["31337", "31338", "41337", "41338", "51337", "51338", "61337", "61338", "71337", "71338"]) pkill9(`sleep ${n}`);
+  rmSync(TMP, { recursive: true, force: true });
+});
+
+// ───────────────────────── Regression: the 10 deployed tools ─────────────────────────
+
+test("R1 existing 10 tools: name/description/inputSchema identical to the deployed baseline", async () => {
+  const baseline = JSON.parse(readFileSync(path.join(ROOT, "test/baseline-tools.json"), "utf8"));
+  assert.deepEqual(baseline.map((t) => t.name).sort(), [...OLD].sort());
+  const { json } = await rpc(BASE, "tools/list");
+  // the baseline was captured on production, where JOBS_DIR is the default; the test server uses a temp dir
+  const live = JSON.parse(JSON.stringify(json.result.tools).replaceAll(JOBS, "/var/lib/ssh-mcp/jobs"));
+  for (const b of baseline) assert.deepEqual(live.find((t) => t.name === b.name), b, `tool ${b.name} changed`);
+});
+
+test("R2 ssh_exec local: exit/stdout/stderr text format unchanged", async () => {
+  const r = await call("ssh_exec", { host: "local", command: "echo out; echo err >&2; exit 3" });
+  assert.equal(r.isError, false);
+  assert.equal(r.text, "exit: 3\n--- stdout ---\nout\n\n--- stderr ---\nerr\n");
+});
+
+test("R3 sftp_write / sftp_read / sftp_list local round-trip", async () => {
+  const f = path.join(TMP, "f.txt");
+  const w = await call("sftp_write", { host: "local", path: f, content: "héllo\n", mode: "0640" });
+  assert.equal(w.text, `Wrote 7 bytes to local:${f}`);
+  assert.equal((await call("sftp_read", { host: "local", path: f })).text, "héllo\n");
+  assert.equal((await call("sftp_read", { host: "local", path: f, encoding: "base64" })).text, Buffer.from("héllo\n").toString("base64"));
+  assert.match((await call("sftp_list", { host: "local", path: TMP })).text, /-rw-r----- .* f\.txt/);
+});
+
+test("R4 secret path: wrong secret 404, GET 405", async () => {
+  assert.equal((await rpc(`http://127.0.0.1:${PORT}/mcp/wrong`, "tools/list")).status, 404);
+  assert.equal((await fetch(BASE)).status, 405);
+});
+
+test("R5 ssh_exec remote (ssh2 path)", async () => {
+  const r = await call("ssh_exec", { host: "remote", command: "echo remote-ok; echo e >&2; exit 4" });
+  assert.equal(r.text, "exit: 4\n--- stdout ---\nremote-ok\n\n--- stderr ---\ne\n");
+});
+
+test("R6 unknown host is an error; list_hosts lists both", async () => {
+  const r = await call("ssh_exec", { host: "nope", command: "true" });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /Unknown host "nope"/);
+  assert.equal((await call("list_hosts", {})).text, `local: (this VPS)\nremote: t@127.0.0.1:${sshd.port}`);
+});
+
+test("R7 ssh_exec keeps MAX_OUT truncation", async () => {
+  const r = await call("ssh_exec", { host: "local", command: "head -c 150000 /dev/zero | tr '\\0' x" });
+  assert.match(r.text, /x\n…\[truncated 50000 chars\]\n--- stderr ---/);
+});
+
+// ───────────────────────── New tools ─────────────────────────
+
+test("N1 tools/list exposes exactly the 16 tools", async () => {
+  const { json } = await rpc(BASE, "tools/list");
+  assert.deepEqual(json.result.tools.map((t) => t.name).sort(), [...OLD, ...NEW, ...V13].sort());
+});
+
+const splitBlocks = (text) => text.split(/\n\n(?==== \[)/).map((b) => {
+  const m = b.match(/^=== \[(.+?)\] (?:exit: (-?\d+|null)|error: (.*?)) \| (\d+\.\d\d)s ===/);
+  assert.ok(m, `bad block header: ${b.slice(0, 120)}`);
+  const out = b.match(/\n--- stdout ---\n([\s\S]*)\n--- stderr ---\n([\s\S]*)$/);
+  return { id: m[1], exit: m[2] === undefined ? undefined : m[2], error: m[3], sec: Number(m[4]), stdout: out?.[1], stderr: out?.[2] };
+});
+
+for (const host of HOSTS) {
+  test(`N2 ssh_exec_many ${host}: concurrent, one block per id with exit/stdout/stderr/duration`, async () => {
+    const t0 = performance.now();
+    const r = await call("ssh_exec_many", { host, commands: [
+      { id: "a", command: "sleep 1; echo A" },
+      { id: "b", command: "sleep 1; echo B >&2; exit 2" },
+      { id: "c", command: "sleep 1; echo C", timeout_sec: 30 },
+    ] });
+    const ms = performance.now() - t0;
+    assert.equal(r.isError, false, r.text);
+    assert.ok(ms < 2700, `took ${ms.toFixed(0)}ms for 3×1s — not concurrent`);
+    const b = splitBlocks(r.text);
+    assert.deepEqual(b.map((x) => x.id), ["a", "b", "c"]);
+    assert.deepEqual(b.map((x) => x.exit), ["0", "2", "0"]);
+    assert.deepEqual(b.map((x) => x.stdout), ["A\n", "", "C\n"]);
+    assert.deepEqual(b.map((x) => x.stderr), ["", "B\n", ""]);
+    for (const x of b) assert.ok(x.sec >= 0.95 && x.sec < 2.7, `duration ${x.sec}`);
+  });
+
+  test(`N3 ssh_exec_many ${host}: a timeout in one command does not affect the others`, async () => {
+    const t0 = performance.now();
+    const r = await call("ssh_exec_many", { host, commands: [
+      { id: "slow", command: "sleep 20", timeout_sec: 1 },
+      { id: "fast", command: "echo ok" },
+    ] });
+    assert.ok(performance.now() - t0 < 6000);
+    const [slow, fast] = splitBlocks(r.text);
+    assert.equal(fast.exit, "0");
+    assert.equal(fast.stdout, "ok\n");
+    assert.ok(slow.error ? /Timed out after 1s/.test(slow.error) : slow.exit !== "0", r.text);
+    assert.ok(slow.sec >= 0.95 && slow.sec < 4);
+  });
+
+  test(`N4 ssh_exec_many ${host}: total output stays bounded (MAX_OUT shared across blocks)`, async () => {
+    const big = "head -c 300000 /dev/zero | tr '\\0' x";
+    const r = await call("ssh_exec_many", { host, commands: [{ id: "one", command: big }, { id: "two", command: big }] });
+    const b = splitBlocks(r.text);
+    for (const x of b) assert.match(x.stdout, /^x{50000}\n…\[truncated 250000 chars\]$/);
+    assert.ok(r.text.length < 2 * MAX_OUT + 1000, `len ${r.text.length}`);
+  });
+}
+
+test("N5 ssh_exec_many validation: duplicate ids, >10 commands, empty list, unknown host", async () => {
+  const dup = await call("ssh_exec_many", { host: "local", commands: [{ id: "x", command: "true" }, { id: "x", command: "true" }] });
+  assert.equal(dup.isError, true);
+  assert.match(dup.text, /Duplicate id "x"/);
+  const many = await call("ssh_exec_many", { host: "local", commands: Array.from({ length: 11 }, (_, i) => ({ id: `c${i}`, command: "true" })) });
+  assert.equal(many.isError, true);
+  assert.equal((await call("ssh_exec_many", { host: "local", commands: [] })).isError, true);
+  const ten = await call("ssh_exec_many", { host: "local", commands: Array.from({ length: 10 }, (_, i) => ({ id: `c${i}`, command: `echo ${i}` })) });
+  assert.equal(ten.isError, false);
+  assert.deepEqual(splitBlocks(ten.text).map((x) => x.stdout), Array.from({ length: 10 }, (_, i) => `${i}\n`));
+  const bad = await call("ssh_exec_many", { host: "nope", commands: [{ id: "x", command: "true" }] });
+  assert.equal(bad.isError, true);
+  assert.match(bad.text, /Unknown host "nope"/);
+});
+
+for (const [i, host] of HOSTS.entries()) {
+  test(`N6 ssh_spawn ${host}: returns immediately; status → running; wait → exit code + log; files on disk`, async () => {
+    const t0 = performance.now();
+    const { jobId, text } = await spawnJob(host, "echo start; sleep 2; echo done; echo oops >&2; exit 7");
+    const ms = performance.now() - t0;
+    assert.ok(ms < 1800, `spawn took ${ms.toFixed(0)}ms — it must not wait for the 2s job`);
+    assert.equal(field(text, "log"), `${JOBS}/${jobId}.log`);
+    const st = await job(host, jobId, "status");
+    assert.equal(st.isError, false, st.text);
+    assert.equal(field(st.text, "job"), jobId);
+    assert.equal(field(st.text, "state"), "running");
+    assert.match(field(st.text, "pid"), /^\d+$/);
+    assert.match(field(st.text, "started"), /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
+    assert.match(field(st.text, "command"), /^echo start; sleep 2/);
+    const w = await job(host, jobId, "wait", { timeout_sec: 20 });
+    assert.equal(field(w.text, "state"), "exited", w.text);
+    assert.equal(field(w.text, "exit"), "7");
+    assert.equal(logPart(w.text), "start\ndone\noops\n");
+    assert.equal(readFileSync(`${JOBS}/${jobId}.exit`, "utf8"), "7\n");
+    assert.equal(readFileSync(`${JOBS}/${jobId}.log`, "utf8"), "start\ndone\noops\n");
+    const again = await job(host, jobId, "status");
+    assert.equal(field(again.text, "state"), "exited");
+    assert.match(field(again.text, "ended"), /^\d{4}-/);
+  });
+
+  test(`N7 ssh_job kill ${host}: SIGTERM ends the whole process group, exit 143`, async () => {
+    const n = 31337 + i;
+    const { jobId } = await spawnJob(host, `sleep ${n}`);
+    assert.notEqual(pgrep(`sleep ${n}`), "");
+    const k = await job(host, jobId, "kill");
+    assert.match(k.text, /kill: terminated with SIGTERM/);
+    assert.equal(field(k.text, "state"), "exited");
+    assert.equal(field(k.text, "exit"), "143");
+    assert.equal(pgrep(`sleep ${n}`), "");
+    assert.match((await job(host, jobId, "kill")).text, /kill: nothing to do \(state: exited\)/);
+  });
+
+  test(`N8 ssh_job kill ${host}: job ignoring SIGTERM gets SIGKILL after 5s, exit 137`, async () => {
+    const n = 41337 + i;
+    const { jobId } = await spawnJob(host, `trap "" TERM; sleep ${n}`);
+    const t0 = performance.now();
+    const k = await job(host, jobId, "kill");
+    assert.ok(performance.now() - t0 >= 4500);
+    assert.match(k.text, /SIGKILL/);
+    assert.equal(field(k.text, "state"), "exited");
+    assert.equal(field(k.text, "exit"), "137");
+    assert.equal(pgrep(`sleep ${n}`), "");
+  });
+
+  test(`N9 ssh_job tail ${host}: last N bytes, default 8 KB`, async () => {
+    const { jobId } = await spawnJob(host, "head -c 20000 /dev/zero | tr '\\0' x; echo; echo END-MARK");
+    await job(host, jobId, "wait", { timeout_sec: 20 });
+    const t = await job(host, jobId, "tail");
+    assert.match(t.text, /--- log \(last 8192 bytes\) ---/);
+    assert.equal(field(t.text, "state"), "exited");
+    assert.equal(logPart(t.text).length, 8192);
+    assert.ok(logPart(t.text).endsWith("x\nEND-MARK\n"));
+    assert.equal(logPart((await job(host, jobId, "tail", { bytes: 10 })).text), "\nEND-MARK\n");
+    assert.match(field(t.text, "log"), /\(20010 bytes\)$/);
+  });
+
+  test(`N10 ssh_job wait ${host}: returns state running when timeout_sec passes first`, async () => {
+    const n = 51337 + i;
+    const { jobId } = await spawnJob(host, `echo waiting; sleep ${n}`);
+    const t0 = performance.now();
+    const w = await job(host, jobId, "wait", { timeout_sec: 2 });
+    const ms = performance.now() - t0;
+    assert.ok(ms >= 1800 && ms < 6000, `wait took ${ms.toFixed(0)}ms`);
+    assert.equal(field(w.text, "state"), "running");
+    assert.match(w.text, /still running after 2s/);
+    assert.equal(logPart(w.text), "waiting\n");
+    await job(host, jobId, "kill");
+    assert.equal(pgrep(`sleep ${n}`), "");
+  });
+
+  test(`N11 ssh_spawn ${host}: command with quotes, $, newlines, heredoc, unicode runs verbatim`, async () => {
+    const cmd = `printf '%s\\n' "it's \\"q\\" $((6*7))"\necho 'ünïcödé ✓'\ncat <<'EOF'\nheredoc $HOME 'single' "double" \\back\nEOF\n`;
+    const { jobId } = await spawnJob(host, cmd);
+    const w = await job(host, jobId, "wait", { timeout_sec: 20 });
+    assert.equal(field(w.text, "exit"), "0", w.text);
+    assert.equal(logPart(w.text), `it's "q" 42\nünïcödé ✓\nheredoc $HOME 'single' "double" \\back\n`);
+    assert.equal(readFileSync(`${JOBS}/${jobId}.cmd`, "utf8"), cmd);
+  });
+
+  test(`N12 ssh_job ${host}: state lost when the job vanished without an exit record`, async () => {
+    const n = 61337 + i;
+    const { jobId } = await spawnJob(host, `sleep ${n}`);
+    const pid = Number(field((await job(host, jobId, "status")).text, "pid"));
+    process.kill(pid, "SIGKILL");
+    pkill9(`sleep ${n}`);
+    await sleep(300);
+    const st = await job(host, jobId, "status");
+    assert.equal(field(st.text, "state"), "lost", st.text);
+    assert.match((await job(host, jobId, "wait", { timeout_sec: 30 })).text, /state: lost/);
+    assert.match((await job(host, jobId, "kill")).text, /kill: nothing to do \(state: lost\)/);
+  });
+
+  test(`N13 ssh_spawn ${host}: 5 concurrent spawns get distinct jobs, all finish 0`, async () => {
+    const jobs = await Promise.all(Array.from({ length: 5 }, (_, k) => spawnJob(host, `echo job-${k}`)));
+    assert.equal(new Set(jobs.map((j) => j.jobId)).size, 5);
+    for (const [k, j] of jobs.entries()) {
+      const w = await job(host, j.jobId, "wait", { timeout_sec: 20 });
+      assert.equal(field(w.text, "exit"), "0");
+      assert.equal(logPart(w.text), `job-${k}\n`);
+    }
+  });
+
+  test(`N14 ssh_jobs ${host}: lists jobs newest first with state and exit code; limit works`, async () => {
+    const a = await spawnJob(host, "exit 3");
+    await job(host, a.jobId, "wait", { timeout_sec: 20 });
+    await sleep(1100); // ids are second-resolution; make ordering deterministic
+    const b = await spawnJob(host, "sleep 30");
+    const l = await call("ssh_jobs", { host });
+    assert.equal(l.isError, false, l.text);
+    const rows = l.text.split("\n").filter((x) => /^\d{8}-\d{6}-/.test(x)).map((x) => x.split("\t"));
+    assert.match(l.text.split("\n")[0], /^JOB\tSTATE\tEXIT\tELAPSED\tSTARTED\tCOMMAND$/);
+    assert.equal(rows[0][0], b.jobId);
+    assert.deepEqual(rows[0].slice(1, 3), ["running", "-"]);
+    const ra = rows.find((r) => r[0] === a.jobId);
+    assert.deepEqual(ra.slice(1, 3), ["exited", "3"]);
+    assert.equal(ra[5], "exit 3");
+    assert.deepEqual(rows.map((r) => r[0]), rows.map((r) => r[0]).sort().reverse());
+    assert.match(l.text, new RegExp(`total: ${readdirSync(JOBS).filter((f) => f.endsWith(".cmd")).length} job\\(s\\) in ${JOBS}`));
+    const one = await call("ssh_jobs", { host, limit: 1 });
+    assert.equal(one.text.split("\n").filter((x) => /^\d{8}-\d{6}-/.test(x)).length, 1);
+    await job(host, b.jobId, "kill");
+  });
+
+  test(`N15 ssh_job ${host}: unknown and malformed jobId are errors`, async () => {
+    const u = await job(host, "20000101-000000-abcdef", "status");
+    assert.equal(u.isError, true);
+    assert.match(u.text, /No such job: 20000101-000000-abcdef/);
+    for (const bad of ["../../etc/passwd", "a b", "x;id", ""]) assert.equal((await job(host, bad, "status")).isError, true, bad);
+    assert.equal((await job(host, "20000101-000000-abcdef", "explode")).isError, true);
+  });
+
+  test(`N16 exec_code ${host}: python — stdout, stderr, exit code`, async () => {
+    const r = await call("exec_code", { host, language: "python", code: 'import sys\nprint("py", sys.version_info[0])\nprint("e", file=sys.stderr)\nsys.exit(5)\n' });
+    assert.equal(r.isError, false, r.text);
+    assert.equal(r.text, "exit: 5\n--- stdout ---\npy 3\n\n--- stderr ---\ne\n");
+  });
+
+  test(`N17 exec_code ${host}: node`, async () => {
+    const r = await call("exec_code", { host, language: "node", code: 'const os = require("os");\nconsole.log(os.platform(), [1, 2, 3].map((x) => x * 2).join(","));\n' });
+    assert.equal(r.text, "exit: 0\n--- stdout ---\nlinux 2,4,6\n\n--- stderr ---\n");
+  });
+
+  test(`N18 exec_code ${host}: bash`, async () => {
+    const r = await call("exec_code", { host, language: "bash", code: 'set -e\narr=(a b c)\necho "${#arr[@]} $((1+2))"\nfalse\necho unreachable\n' });
+    assert.equal(r.text, "exit: 1\n--- stdout ---\n3 3\n\n--- stderr ---\n");
+  });
+
+  test(`N19 exec_code ${host}: timeout kills the script, keeps partial output, reports it`, async () => {
+    const t0 = performance.now();
+    const r = await call("exec_code", { host, language: "python", timeout_sec: 2, code: 'import time\nprint("begin", flush=True)\nwhile True:\n    time.sleep(0.2)\n' });
+    const ms = performance.now() - t0;
+    assert.ok(ms >= 1900 && ms < 9000, `took ${ms.toFixed(0)}ms`);
+    assert.equal(r.text, "exit: 124 (timed out after 2s)\n--- stdout ---\nbegin\n\n--- stderr ---\n");
+    await sleep(200);
+    assert.equal(pgrep("ssh-mcp-code\\."), "");
+  });
+
+  test(`N20 exec_code ${host}: code with quotes, backslashes, $, backticks, unicode is written verbatim; stdin is empty`, async () => {
+    const code = `import sys\ns = 'it\\'s "x" \\\\ $HOME \`bt\` ✓'\nprint(s)\nprint('''triple ' " ''')\nprint(repr(sys.stdin.read()))\n`;
+    const r = await call("exec_code", { host, language: "python", code, timeout_sec: 20 });
+    assert.equal(r.text, `exit: 0\n--- stdout ---\nit's "x" \\ $HOME \`bt\` ✓\ntriple ' " \n''\n\n--- stderr ---\n`);
+  });
+}
+
+test("N21 exec_code validation: oversize code, unknown language, unknown host", async () => {
+  const big = await call("exec_code", { host: "local", language: "bash", code: "#".repeat(70_000) });
+  assert.equal(big.isError, true);
+  assert.match(big.text, /too large/);
+  assert.equal((await call("exec_code", { host: "local", language: "ruby", code: "puts 1" })).isError, true);
+  const bad = await call("exec_code", { host: "nope", language: "bash", code: "true" });
+  assert.equal(bad.isError, true);
+  assert.match(bad.text, /Unknown host "nope"/);
+  const okBig = await call("exec_code", { host: "local", language: "bash", code: "echo fits\n" + "#".repeat(60_000) });
+  assert.equal(okBig.text, "exit: 0\n--- stdout ---\nfits\n\n--- stderr ---\n");
+});
+
+test("N22 exec_code leaves no temp files behind", () => {
+  assert.deepEqual(readdirSync(CODE_TMP).filter((f) => f.startsWith("ssh-mcp-code")), []);
+});
+
+test("N23 jobs dir falls back to $HOME/.ssh-mcp/jobs when the configured dir is not writable", async () => {
+  const { jobId, text } = await spawnJob("local", "echo fallback", BASE2);
+  assert.equal(field(text, "log"), `${HOME2}/.ssh-mcp/jobs/${jobId}.log`);
+  const w = await job("local", jobId, "wait", { timeout_sec: 20 }, BASE2);
+  assert.equal(field(w.text, "exit"), "0");
+  assert.equal(logPart(w.text), "fallback\n");
+  assert.ok(existsSync(`${HOME2}/.ssh-mcp/jobs/${jobId}.exit`));
+  assert.match((await call("ssh_jobs", { host: "local" }, BASE2)).text, new RegExp(`${jobId}\texited\t0\t`));
+});
+
+test("N24 ssh_spawn validation: oversize command, unknown host", async () => {
+  const big = await call("ssh_spawn", { host: "local", command: ":".repeat(70_000) });
+  assert.equal(big.isError, true);
+  assert.match(big.text, /too large/);
+  const bad = await call("ssh_spawn", { host: "nope", command: "true" });
+  assert.equal(bad.isError, true);
+  assert.match(bad.text, /Unknown host "nope"/);
+});
+
+// ═════════════════════════ v1.2: the same four tools a sandbox has, on the host ═════════════════════════
+
+const P = (...a) => path.join(TMP, ...a);
+const tool = async (name, args, base = BASE) => (await rpc(base, "tools/call", { name, arguments: args })).json.result;
+const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+test("R8 sftp_write / sftp_read / sftp_list remote round-trip (real SFTP path)", async () => {
+  const f = P("rf.txt");
+  const w = await call("sftp_write", { host: "remote", path: f, content: "remote héllo\n", mode: "0640" });
+  assert.equal(w.text, `Wrote 14 bytes to remote:${f}`);
+  assert.equal(readFileSync(f, "utf8"), "remote héllo\n");
+  assert.equal((await call("sftp_read", { host: "remote", path: f })).text, "remote héllo\n");
+  assert.match((await call("sftp_list", { host: "remote", path: TMP })).text, /rf\.txt/);
+});
+
+for (const [i, host] of HOSTS.entries()) {
+  test(`P1 bash ${host}: merged output in order, exit code line only on failure`, async () => {
+    const ok = await call("bash", { host, command: "echo out; echo err >&2; echo out2" });
+    assert.equal(ok.isError, false, ok.text);
+    assert.equal(ok.text, "out\nerr\nout2\n");
+    const bad = await call("bash", { host, command: "echo out; echo err >&2; exit 3", description: "ignored label" });
+    assert.equal(bad.text, "out\nerr\n[exit code: 3]");
+    assert.equal((await call("bash", { host, command: "true" })).text, "(no output)");
+    assert.equal((await call("bash", { host, command: "printf 'no newline'; exit 1" })).text, "no newline\n[exit code: 1]");
+  });
+
+  test(`P2 bash ${host}: cwd param; default is the home directory; cd does not leak without a session`, async () => {
+    assert.equal((await call("bash", { host, command: "pwd", cwd: TMP })).text, TMP + "\n");
+    assert.equal((await call("bash", { host, command: "pwd" })).text, process.env.HOME + "\n");
+    await call("bash", { host, command: "cd /tmp" });
+    assert.equal((await call("bash", { host, command: "pwd" })).text, process.env.HOME + "\n");
+    const miss = await call("bash", { host, command: "pwd", cwd: "/nonexistent-dir-xyz" });
+    assert.equal(miss.isError, true);
+    assert.match(miss.text, /No such directory: \/nonexistent-dir-xyz/);
+  });
+
+  test(`P3 bash ${host}: session keeps the working directory between calls, sessions are isolated`, async () => {
+    const s = `sess-${host}`;
+    mkdirSync(P("proj", "sub"), { recursive: true });
+    assert.equal((await call("bash", { host, session: s, command: `cd ${P("proj")}` })).text, `[cwd: ${P("proj")}]`);
+    assert.equal((await call("bash", { host, session: s, command: "pwd" })).text, P("proj") + "\n");
+    assert.equal((await call("bash", { host, session: s, command: "cd sub && pwd; false" })).text, `${P("proj", "sub")}\n[exit code: 1]\n[cwd: ${P("proj", "sub")}]`);
+    assert.equal((await call("bash", { host, session: s, command: "pwd" })).text, P("proj", "sub") + "\n");
+    assert.equal((await call("bash", { host, session: `other-${host}`, command: "pwd" })).text, process.env.HOME + "\n");
+    assert.equal((await call("bash", { host, session: s, cwd: TMP, command: "pwd" })).text, `${TMP}\n[cwd: ${TMP}]`); // explicit cwd wins and is remembered
+    assert.equal((await call("bash", { host, session: s, command: "pwd" })).text, TMP + "\n");
+    assert.equal((await call("bash", { host, session: "bad name!", command: "pwd" })).isError, true);
+  });
+
+  test(`P4 bash ${host}: timeout (ms) kills the command, keeps partial output`, async () => {
+    const t0 = performance.now();
+    const r = await call("bash", { host, timeout: 1500, command: "echo begin; sleep 20; echo never" });
+    assert.ok(performance.now() - t0 < 9000);
+    assert.equal(r.text, "begin\n[timed out after 2s - exit code: 124]");
+  });
+
+  test(`P5 bash ${host}: oversized output is cut in the middle and kept in full on the host`, async () => {
+    const r = await call("bash", { host, command: "head -c 300000 /dev/zero | tr '\\0' x; echo; echo END" });
+    assert.ok(r.text.length < MAX_OUT + 600, `len ${r.text.length}`);
+    assert.ok(r.text.startsWith("xxxx") && r.text.endsWith("x\nEND\n"), r.text.slice(-40));
+    const m = r.text.match(/\[(\d+) bytes omitted - full output saved on the host: (\S+)\]/);
+    assert.ok(m, r.text.slice(59_900, 60_300));
+    assert.equal(Number(m[1]), 300_005 - 98_000);
+    assert.equal(statSync(m[2]).size, 300_005);
+    const tail = await call("bash", { host, command: `tail -c 5 ${m[2]}` });
+    assert.equal(tail.text, "\nEND\n");
+  });
+
+  test(`P6 bash ${host}: a child left running in the background does not block the call`, async () => {
+    const n = 71337 + i;
+    const t0 = performance.now();
+    const r = await call("bash", { host, command: `sleep ${n} & echo started` });
+    assert.ok(performance.now() - t0 < 4000, "call waited for the background child");
+    assert.equal(r.text, "started\n");
+    assert.notEqual(pgrep(`sleep ${n}`), "");
+    pkill9(`sleep ${n}`);
+  });
+
+  test(`P7 bash ${host}: run_in_background returns a job id; cwd applies`, async () => {
+    const r = await call("bash", { host, cwd: TMP, run_in_background: true, command: "pwd; sleep 1; echo bg-done" });
+    assert.equal(r.isError, false, r.text);
+    const jobId = field(r.text, "jobId");
+    assert.match(jobId, /^\d{8}-\d{6}-[0-9a-f]{6}$/, r.text);
+    const w = await job(host, jobId, "wait", { timeout_sec: 20 });
+    assert.equal(field(w.text, "exit"), "0", w.text);
+    assert.equal(logPart(w.text), `${TMP}\nbg-done\n`);
+  });
+
+  test(`P8 bash ${host}: quotes, $, heredoc, unicode run verbatim; stdin is empty`, async () => {
+    const cmd = `printf '%s\\n' "it's \\"q\\" $((6*7))"\ncat <<'EOF'\nheredoc $HOME \\back ✓\nEOF\ncat; echo "stdin-done"`;
+    assert.equal((await call("bash", { host, command: cmd })).text, `it's "q" 42\nheredoc $HOME \\back ✓\nstdin-done\n`);
+  });
+
+  test(`P10 read ${host}: numbered lines like cat -n, offset/limit, footers`, async () => {
+    const f = P(`read-${host}.txt`);
+    writeFileSync(f, "l1\nl2\n\tl3 tabbed\nl4\nl5"); // no trailing newline
+    assert.equal((await call("read", { host, file_path: f })).text, "     1\tl1\n     2\tl2\n     3\t\tl3 tabbed\n     4\tl4\n     5\tl5\n");
+    assert.equal((await call("read", { host, file_path: f, offset: 2, limit: 2 })).text, "     2\tl2\n     3\t\tl3 tabbed\n[lines 2-3 shown; more follow - continue with offset=4]\n");
+    assert.equal((await call("read", { host, file_path: f, offset: 4, limit: 2 })).text, "     4\tl4\n     5\tl5\n");
+    assert.equal((await call("read", { host, file_path: f, offset: 10 })).text, "[offset 10 is past the end of the file (5 lines)]\n");
+    writeFileSync(f, "");
+    assert.equal((await call("read", { host, file_path: f })).text, "(empty file)\n");
+    writeFileSync(f, "x".repeat(2500) + "\nshort\n");
+    assert.equal((await call("read", { host, file_path: f })).text, `     1\t${"x".repeat(2000)}... [line truncated]\n     2\tshort\n`);
+  });
+
+  test(`P11 read ${host}: missing file, directory, binary and bad input are errors`, async () => {
+    writeFileSync(P(`bin-${host}`), Buffer.from([1, 2, 0, 3, 4, 5]));
+    for (const [fp, re] of [[P("nope.txt"), /File does not exist/], [TMP, /is a directory/], [P(`bin-${host}`), /Binary file \(6 bytes\)/]]) {
+      const r = await call("read", { host, file_path: fp });
+      assert.equal(r.isError, true, r.text);
+      assert.match(r.text, re);
+    }
+    assert.equal((await call("read", { host })).isError, true); // neither file_path nor files
+    assert.equal((await call("read", { host, file_path: "relative.txt" })).isError, true);
+  });
+
+  test(`P12 read ${host}: several files in one call, per-file errors inline, shared output budget`, async () => {
+    const a = P(`ra-${host}.txt`), b = P(`rb-${host}.txt`);
+    writeFileSync(a, "A1\nA2\nA3\n");
+    writeFileSync(b, "B1\n");
+    const r = await call("read", { host, files: [{ file_path: a, offset: 2 }, { file_path: P("nope.txt") }, { file_path: b }] });
+    assert.equal(r.isError, false, r.text);
+    assert.equal(r.text, `=== ${a} ===\n     2\tA2\n     3\tA3\n\n=== ${P("nope.txt")} ===\nERROR: File does not exist: ${P("nope.txt")}\n\n=== ${b} ===\n     1\tB1\n`);
+    const big = [1, 2, 3, 4].map((k) => P(`big${k}-${host}.txt`));
+    for (const f of big) writeFileSync(f, Array.from({ length: 5000 }, (_, k) => `line ${k} ${"y".repeat(40)}`).join("\n") + "\n");
+    const many = await call("read", { host, files: big.map((file_path) => ({ file_path })) });
+    assert.ok(many.text.length <= MAX_OUT + 2000, `len ${many.text.length}`);
+    assert.equal((many.text.match(/output budget reached/g) ?? []).length, 4);
+    for (const f of big) assert.ok(many.text.includes(`=== ${f} ===\n     1\tline 0 `));
+    assert.equal((await call("read", { host, files: [{ file_path: P("nope1") }, { file_path: P("nope2") }] })).isError, true);
+  });
+
+  test(`P13 read ${host}: an image comes back as an image block`, async () => {
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
+    const f = P(`dot-${host}.png`);
+    writeFileSync(f, png);
+    const res = await tool("read", { host, file_path: f });
+    const img = res.content.find((c) => c.type === "image");
+    assert.ok(img, JSON.stringify(res).slice(0, 300));
+    assert.equal(img.mimeType, "image/png");
+    assert.ok(Buffer.from(img.data, "base64").equals(png));
+    const mix = await tool("read", { host, files: [{ file_path: f }, { file_path: P(`ra-${host}.txt`) }] });
+    assert.deepEqual(mix.content.map((c) => c.type), ["text", "image", "text"]);
+  });
+
+  test(`P14 write ${host}: creates parent directories, overwrite keeps the file mode`, async () => {
+    const f = P(`w-${host}`, "deep", "er", "file.txt");
+    const w = await call("write", { host, file_path: f, content: "héllo ✓\nline2\n" });
+    assert.equal(w.isError, false, w.text);
+    assert.equal(w.text, `Wrote 17 bytes to ${host}:${f}`);
+    assert.equal(readFileSync(f, "utf8"), "héllo ✓\nline2\n");
+    chmodSync(f, 0o600);
+    await call("write", { host, file_path: f, content: "v2\n" });
+    assert.equal(readFileSync(f, "utf8"), "v2\n");
+    assert.equal(statSync(f).mode & 0o777, 0o600);
+  });
+
+  test(`P15 write ${host}: 30 files in one call, per-file errors do not stop the rest`, async () => {
+    const files = Array.from({ length: 30 }, (_, k) => ({ file_path: P(`bulk-${host}`, `d${k % 5}`, `f${k}.txt`), content: `content ${k}\n`.repeat(k + 1) }));
+    files[0].mode = "0750";
+    const w = await call("write", { host, files });
+    assert.equal(w.isError, false, w.text);
+    assert.match(w.text, /30 files written, \d+ bytes$/);
+    for (const f of files) assert.equal(readFileSync(f.file_path, "utf8"), f.content);
+    assert.equal(statSync(files[0].file_path).mode & 0o777, 0o750);
+    const bad = await call("write", { host, files: [{ file_path: P(`bulk-${host}`, "ok.txt"), content: "ok" }, { file_path: "/proc/nope/x.txt", content: "x" }] });
+    assert.equal(bad.isError, true);
+    assert.match(bad.text, /ERROR \/proc\/nope\/x\.txt/);
+    assert.equal(readFileSync(P(`bulk-${host}`, "ok.txt"), "utf8"), "ok");
+  });
+
+  test(`P16 edit ${host}: exact unique replacement, numbered snippet, mode preserved`, async () => {
+    const f = P(`e-${host}.js`);
+    writeFileSync(f, "const a = 1;\nconst b = 2;\nfunction f() {\n  return a + b;\n}\n");
+    chmodSync(f, 0o755);
+    const r = await call("edit", { host, file_path: f, old_string: "  return a + b;", new_string: "  return a * b; // $& $1 literal" });
+    assert.equal(r.isError, false, r.text);
+    assert.match(r.text, new RegExp(`^Edited ${host}:${reEsc(f)}: 1 replacement\\n`));
+    assert.ok(r.text.includes("     4\t  return a * b; // $& $1 literal\n"), r.text);
+    assert.equal(readFileSync(f, "utf8"), "const a = 1;\nconst b = 2;\nfunction f() {\n  return a * b; // $& $1 literal\n}\n");
+    assert.equal(statSync(f).mode & 0o777, 0o755);
+  });
+
+  test(`P17 edit ${host}: not found / ambiguous / replace_all / invalid input leave the file alone`, async () => {
+    const f = P(`e2-${host}.txt`);
+    const orig = "x = 1\nx = 1\nx = 1\ny = 2\n";
+    writeFileSync(f, orig);
+    const nf = await call("edit", { host, file_path: f, old_string: "z = 9", new_string: "z = 0" });
+    assert.equal(nf.isError, true);
+    assert.match(nf.text, /old_string not found/);
+    const amb = await call("edit", { host, file_path: f, old_string: "x = 1", new_string: "x = 5" });
+    assert.equal(amb.isError, true);
+    assert.match(amb.text, /matches 3 places/);
+    assert.equal(readFileSync(f, "utf8"), orig);
+    const all = await call("edit", { host, file_path: f, old_string: "x = 1", new_string: "x = 5", replace_all: true });
+    assert.match(all.text, /: 3 replacements\n/);
+    assert.equal(readFileSync(f, "utf8"), "x = 5\nx = 5\nx = 5\ny = 2\n");
+    assert.equal((await call("edit", { host, file_path: f, old_string: "y = 2", new_string: "y = 2" })).isError, true);
+    assert.equal((await call("edit", { host, file_path: P("missing.txt"), old_string: "a", new_string: "b" })).isError, true);
+    const bin = P(`e3-${host}.bin`);
+    writeFileSync(bin, Buffer.from([0x61, 0xff, 0xfe, 0x62]));
+    const nb = await call("edit", { host, file_path: bin, old_string: "a", new_string: "c" });
+    assert.equal(nb.isError, true);
+    assert.match(nb.text, /not valid UTF-8/);
+    assert.ok(readFileSync(bin).equals(Buffer.from([0x61, 0xff, 0xfe, 0x62])));
+  });
+
+  test(`P18 edit ${host}: many edits in one call, applied in order, all-or-nothing per file`, async () => {
+    const a = P(`m-a-${host}.txt`), b = P(`m-b-${host}.txt`), c = P(`m-c-${host}.txt`);
+    writeFileSync(a, "one\ntwo\nthree\n");
+    writeFileSync(b, "alpha\nbeta\n");
+    writeFileSync(c, "keep\n");
+    const r = await call("edit", { host, edits: [
+      { file_path: a, old_string: "one", new_string: "ONE" },
+      { file_path: b, old_string: "alpha", new_string: "ALPHA" },
+      { file_path: a, old_string: "ONE\ntwo", new_string: "1\n2" }, // sees the result of the first edit
+      { file_path: b, old_string: "gamma", new_string: "GAMMA" },   // fails -> b stays untouched
+      { file_path: c, old_string: "keep", new_string: "kept" },
+    ] });
+    assert.equal(r.isError, true, r.text);
+    assert.equal(readFileSync(a, "utf8"), "1\n2\nthree\n");
+    assert.equal(readFileSync(b, "utf8"), "alpha\nbeta\n");
+    assert.equal(readFileSync(c, "utf8"), "kept\n");
+    assert.match(r.text, new RegExp(`OK ${host}:${reEsc(a)}: 2 edits`));
+    assert.match(r.text, new RegExp(`FAILED ${host}:${reEsc(b)} \\(not modified\\): edit #4: old_string not found`));
+    const ok = await call("edit", { host, edits: [{ file_path: b, old_string: "beta", new_string: "BETA" }, { file_path: c, old_string: "kept", new_string: "done" }] });
+    assert.equal(ok.isError, false, ok.text);
+    assert.equal(readFileSync(b, "utf8"), "alpha\nBETA\n");
+    assert.equal(readFileSync(c, "utf8"), "done\n");
+  });
+}
+
+// ═════════════════════════ v1.2: bridge (direct sandbox <-> host path, no model in between) ═════════════════════════
+
+const signTok = (exp) => `${exp.toString(36)}.${createHmac("sha256", SECRET).update("bridge:" + exp).digest("hex").slice(0, 32)}`;
+const now = () => Math.floor(Date.now() / 1000);
+const p64 = (s) => Buffer.from(s).toString("base64url");
+let BR; // base URL carrying a token minted by the bridge tool
+
+test("G1 bridge tool mints a time-limited URL for sandbox shells", async () => {
+  const r = await call("bridge", { ttl_hours: 2 });
+  assert.equal(r.isError, false, r.text);
+  const m = r.text.match(/(http:\/\/127\.0\.0\.1:\d+\/b\/([0-9a-z]+\.[0-9a-f]{32}))\/cli/);
+  assert.ok(m, r.text);
+  BR = m[1];
+  const exp = parseInt(m[2].split(".")[0], 36);
+  assert.ok(Math.abs(exp - (now() + 7200)) < 60, `exp ${exp}`);
+  assert.equal(m[2], signTok(exp));
+  assert.match(r.text, /box (exec|put|get|push|pull)/);
+});
+
+test("G2 bridge auth: only a valid, unexpired token opens /b/<token>/...", async () => {
+  const good = `http://127.0.0.1:${PORT}/b/${signTok(now() + 600)}`;
+  assert.equal((await rpc(`${good}/mcp`, "tools/list")).json.result.tools.length, 16);
+  assert.equal((await call("ssh_exec", { host: "local", command: "echo via-bridge" }, `${good}/mcp`)).text, "exit: 0\n--- stdout ---\nvia-bridge\n\n--- stderr ---\n");
+  const expired = `http://127.0.0.1:${PORT}/b/${signTok(now() - 5)}`;
+  const forged = `http://127.0.0.1:${PORT}/b/${(now() + 600).toString(36)}.${"0".repeat(32)}`;
+  for (const bad of [expired, forged, `http://127.0.0.1:${PORT}/b/garbage`]) {
+    assert.equal((await rpc(`${bad}/mcp`, "tools/list")).status, 404);
+    assert.equal((await fetch(`${bad}/cli`)).status, 404);
+    assert.equal((await fetch(`${bad}/fs/local?p64=${p64("/etc/hostname")}`)).status, 404);
+  }
+});
+
+for (const host of HOSTS) {
+  test(`G3 bridge fs ${host}: binary upload/download round-trip, parents, mode, errors`, async () => {
+    const data = randomBytes(3 * 1024 * 1024 + 123);
+    const remote = P(`br-${host}`, "a b", "ünï", "blob.bin");
+    const put = await fetch(`${BR}/fs/${host}?p64=${p64(remote)}&mode=0640`, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: data });
+    assert.equal(put.status, 200, await put.text());
+    assert.ok(readFileSync(remote).equals(data));
+    assert.equal(statSync(remote).mode & 0o777, 0o640);
+    const get = await fetch(`${BR}/fs/${host}?p64=${p64(remote)}`);
+    assert.equal(get.status, 200);
+    assert.equal(get.headers.get("content-length"), String(data.length));
+    assert.ok(Buffer.from(await get.arrayBuffer()).equals(data));
+    assert.equal((await fetch(`${BR}/fs/${host}?path=${encodeURIComponent(remote)}`)).status, 200); // plain ?path= works too
+    assert.equal((await fetch(`${BR}/fs/${host}?p64=${p64(P("nope.bin"))}`)).status, 404);
+    assert.equal((await fetch(`${BR}/fs/${host}?p64=${p64("relative.bin")}`)).status, 400);
+    assert.equal((await fetch(`${BR}/fs/nohost?p64=${p64(remote)}`)).status, 404);
+  });
+
+  test(`G4 bridge tar ${host}: a directory tree goes up and comes back identical`, async () => {
+    const src = P(`tree-${host}`), dst = P(`tree-dst-${host}`), back = P(`tree-back-${host}`);
+    for (let k = 0; k < 40; k++) {
+      mkdirSync(path.join(src, `d${k % 4}`, "x"), { recursive: true });
+      writeFileSync(path.join(src, `d${k % 4}`, "x", `f${k}.bin`), randomBytes(1000 + k));
+    }
+    mkdirSync(path.join(src, "node_modules"));
+    writeFileSync(path.join(src, "node_modules", "skip.js"), "skip");
+    const tgz = execFileSync("tar", ["-C", src, "-czf", "-", "."], { maxBuffer: 64 << 20 });
+    const up = await fetch(`${BR}/tar/${host}?p64=${p64(dst)}`, { method: "PUT", headers: { "Content-Type": "application/gzip" }, body: tgz });
+    assert.equal(up.status, 200, await up.text());
+    execFileSync("diff", ["-r", src, dst]);
+    const down = await fetch(`${BR}/tar/${host}?p64=${p64(dst)}&x=node_modules`);
+    assert.equal(down.status, 200);
+    mkdirSync(back);
+    execFileSync("tar", ["-C", back, "-xzf", "-"], { input: Buffer.from(await down.arrayBuffer()) });
+    assert.equal(existsSync(path.join(back, "node_modules")), false);
+    execFileSync("diff", ["-r", "-x", "node_modules", src, back]);
+    assert.equal((await fetch(`${BR}/tar/${host}?p64=${p64(P("no-such-dir"))}`)).status, 404);
+  });
+
+  test(`G5 bridge exec ${host}: raw merged output, exit code in a header, cwd, timeout, no truncation`, async () => {
+    const KEPT_OUT = new Set(existsSync(path.join(TMP, "out")) ? readdirSync(path.join(TMP, "out")) : []); // oversized outputs kept by earlier bash-tool tests
+    const r = await fetch(`${BR}/exec/${host}?c64=${p64(TMP)}`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: "pwd; echo err >&2; exit 7" });
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get("x-exit-code"), "7");
+    assert.equal(await r.text(), `${TMP}\nerr\n`);
+    const t = await fetch(`${BR}/exec/${host}?timeout=1`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: "echo a; sleep 20" });
+    assert.equal(t.headers.get("x-exit-code"), "124");
+    assert.equal(await t.text(), "a\n");
+    const big = await fetch(`${BR}/exec/${host}`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: "head -c 400000 /dev/zero | tr '\\0' z" });
+    assert.equal((await big.text()).length, 400000);
+    // far beyond any in-memory buffer: streamed, with an exact length and the exit code up front
+    const huge = await fetch(`${BR}/exec/${host}`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: "head -c 12000000 /dev/zero | tr '\\0' q; exit 5" });
+    assert.equal(huge.status, 200);
+    assert.equal(huge.headers.get("content-length"), "12000000");
+    assert.equal(huge.headers.get("x-exit-code"), "5");
+    const buf = Buffer.from(await huge.arrayBuffer());
+    assert.equal(buf.length, 12000000);
+    assert.ok(buf[0] === 0x71 && buf[6_000_000] === 0x71 && buf[11_999_999] === 0x71);
+    const none = await fetch(`${BR}/exec/${host}`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: "true" });
+    assert.deepEqual([none.status, none.headers.get("x-exit-code"), none.headers.get("content-length"), await none.text()], [200, "0", "0", ""]);
+    const badCwd = await fetch(`${BR}/exec/${host}?c64=${p64(P("no-such-dir"))}`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: "pwd" });
+    assert.equal(badCwd.status, 500);
+    assert.match(await badCwd.text(), /No such directory/);
+    assert.equal((await fetch(`${BR}/exec/${host}`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: "  " })).status, 400);
+    assert.equal((await fetch(`${BR}/exec/${host}`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: "#".repeat(70_000) })).status, 413);
+    assert.deepEqual(readdirSync(path.join(TMP, "out")).filter((f) => !KEPT_OUT.has(f)), [], "raw exec leaves no output files behind");
+  });
+}
+
+test("G6 box CLI served by the connector: tools, exec, put/get, push/pull, call - local and remote", async () => {
+  const cli = P("box");
+  writeFileSync(cli, await (await fetch(`${BR}/cli`)).text(), { mode: 0o755 });
+  // async on purpose: the "remote" SSH server lives in this process, a sync child would freeze it
+  const run = promisify(execFile);
+  const box = async (args, opts = {}, input = "") => {
+    const pr = run("bash", [cli, ...args], { encoding: "utf8", maxBuffer: 64 << 20, ...opts });
+    pr.child.stdin.end(input);
+    return (await pr).stdout;
+  };
+  assert.deepEqual((await box(["tools"])).trim().split(/\s+/).sort(), [...OLD, ...NEW, ...V13].sort());
+  assert.equal(await box(["exec", "--", "echo hi; echo e >&2"]), "hi\ne\n");
+  assert.equal(await box(["exec", "-C", TMP, "remote", "--", "pwd"]), TMP + "\n");
+  assert.equal(await box(["exec", "--", "-"], {}, "cd /tmp\npwd\nexit 4\n").catch((e) => `${e.code}:${e.stdout}`), "4:/tmp\n"); // script from stdin
+  assert.equal(await box(["exec", "--", "-"]).catch((e) => e.code), 2);                 // ...and an empty one is refused by the client
+  const failed = await box(["exec", "--", "echo out; exit 3"]).catch((e) => e);
+  assert.equal(failed.code, 3);
+  assert.equal(failed.stdout, "out\n");
+  for (const host of HOSTS) {
+    const data = randomBytes(500_000), src = P(`cli-src-${host}.bin`), rem = P(`cli-${host}`, "up load.bin"), back = P(`cli-back-${host}.bin`);
+    writeFileSync(src, data);
+    await box(["put", src, `${host}:${rem}`, "0600"]);
+    assert.ok(readFileSync(rem).equals(data));
+    assert.equal(statSync(rem).mode & 0o777, 0o600);
+    await box(["get", `${host}:${rem}`, back]);
+    assert.ok(readFileSync(back).equals(data));
+    assert.ok((await run("bash", [cli, "get", `${host}:${rem}`, "-"], { encoding: "buffer", maxBuffer: 64 << 20 })).stdout.equals(data));
+    const tree = P(`tree-${host}`), up = P(`cli-tree-${host}`), down = P(`cli-tree-back-${host}`);
+    await box(["push", tree, `${host}:${up}`, "-x", "node_modules"]);
+    execFileSync("diff", ["-r", "-x", "node_modules", tree, up]);
+    assert.equal(existsSync(path.join(up, "node_modules")), false);
+    await box(["pull", `${host}:${up}`, down]);
+    execFileSync("diff", ["-r", up, down]);
+  }
+  assert.ok((await box(["put", P("cli-src-local.bin"), P("cli-default-host.bin")])).includes("500000")); // host defaults to local
+  assert.match(await box(["call", "ssh_exec", JSON.stringify({ host: "local", command: "echo from-call" })]), /from-call/);
+  assert.match(await box(["--version"]), /^box \d/);
+});
+
+test("G7 bridge: 16 parallel downloads on one token", async () => {
+  const f = P("par.bin");
+  const data = randomBytes(200_000);
+  writeFileSync(f, data);
+  const all = await Promise.all(Array.from({ length: 16 }, () => fetch(`${BR}/fs/local?p64=${p64(f)}`).then((r) => r.arrayBuffer())));
+  for (const b of all) assert.ok(Buffer.from(b).equals(data));
+});
+
+test("G8 a bridge URL cannot mint another bridge URL (it must expire when it says it does)", async () => {
+  const r = await call("bridge", { ttl_hours: 100 }, `${BR}/mcp`);
+  assert.equal(r.isError, true, r.text);
+  assert.match(r.text, /cannot create another/);
+  assert.doesNotMatch(r.text, /\/b\//);
+});
+
+// Send only the first part of an upload, then drop the connection.
+const brokenPut = (url, total, send) => new Promise((resolve) => {
+  const u = new URL(url);
+  const req = http.request({ host: u.hostname, port: u.port, path: u.pathname + u.search, method: "PUT", headers: { "Content-Type": "application/octet-stream", "Content-Length": total } });
+  req.on("error", () => {});
+  req.write(randomBytes(send), () => setTimeout(() => { req.destroy(); resolve(); }, 300));
+});
+
+for (const host of HOSTS) {
+  test(`G9 bridge upload ${host}: all-or-nothing, keeps mode, writes through symlinks, needs a length`, async () => {
+    const dir = P(`atomic-${host}`), f = path.join(dir, "app.bin"), link = path.join(dir, "link.bin");
+    mkdirSync(dir);
+    writeFileSync(f, "old content\n", { mode: 0o600 });
+    chmodSync(f, 0o600);
+    await brokenPut(`${BR}/fs/${host}?p64=${p64(f)}`, 5_000_000, 100_000);
+    for (let i = 0; i < 60 && (readdirSync(dir).length !== 1 || pgrep(f)); i++) await sleep(100);
+    assert.deepEqual(readdirSync(dir), ["app.bin"], "no partial file is left behind");
+    assert.equal(readFileSync(f, "utf8"), "old content\n", "the existing file is untouched");
+    assert.equal(pgrep(f), "", "nothing is left waiting for the rest of the upload");
+    // a complete upload replaces the content and keeps the existing mode
+    const put = await fetch(`${BR}/fs/${host}?p64=${p64(f)}`, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: "new content\n" });
+    assert.equal(put.status, 200, await put.text());
+    assert.equal(readFileSync(f, "utf8"), "new content\n");
+    assert.equal(statSync(f).mode & 0o777, 0o600);
+    // JSON is just bytes here (no body parser may eat it)
+    const js = await fetch(`${BR}/fs/${host}?p64=${p64(path.join(dir, "data.json"))}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: '{"a": 1}' });
+    assert.equal(js.status, 200, await js.text());
+    assert.equal(readFileSync(path.join(dir, "data.json"), "utf8"), '{"a": 1}');
+    // a symlink stays a symlink; its target gets the bytes
+    execFileSync("ln", ["-s", f, link]);
+    const viaLink = await fetch(`${BR}/fs/${host}?p64=${p64(link)}`, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: "through the link\n" });
+    assert.equal(viaLink.status, 200, await viaLink.text());
+    assert.ok(lstatSync(link).isSymbolicLink());
+    assert.equal(readFileSync(f, "utf8"), "through the link\n");
+    // a directory is refused, and so is a body of unknown length
+    assert.equal((await fetch(`${BR}/fs/${host}?p64=${p64(dir)}`, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: "x" })).status, 500);
+    const status = await new Promise((resolve, reject) => {
+      const u = new URL(`${BR}/fs/${host}?p64=${p64(path.join(dir, "chunked.bin"))}`);
+      const req = http.request({ host: u.hostname, port: u.port, path: u.pathname + u.search, method: "PUT", headers: { "Transfer-Encoding": "chunked" } }, (res) => { res.resume(); resolve(res.statusCode); });
+      req.on("error", reject);
+      req.end("abc");
+    });
+    assert.equal(status, 411);
+    assert.equal(existsSync(path.join(dir, "chunked.bin")), false);
+  });
+}
+
+test("G10 a client that disconnects mid-download does not leave the transfer running on the host", async () => {
+  const dir = P("slow-tree");
+  mkdirSync(dir);
+  execFileSync("truncate", ["-s", "3G", path.join(dir, "sparse.bin")]); // ~10 s of gzip work
+  const ac = new AbortController();
+  const r = await fetch(`${BR}/tar/local?p64=${p64(dir)}`, { signal: ac.signal });
+  await r.body.getReader().read();
+  assert.notEqual(pgrep(`tar -C ${dir}`), "", "tar is running");
+  ac.abort();
+  for (let i = 0; i < 60 && pgrep(`tar -C ${dir}`); i++) await sleep(100);
+  assert.equal(pgrep(`tar -C ${dir}`), "", "tar was stopped");
+  assert.equal((await rpc(BASE, "tools/list")).status, 200); // and the server is fine
+});
+
+// ═════════════════════════ v1.3: fewer round trips - batch, quiet output, server instructions ═════════════════════════
+
+test("V1 the five v1.2 tools are unchanged (bash only gained the optional `quiet`)", async () => {
+  const baseline = JSON.parse(readFileSync(path.join(ROOT, "test/baseline-tools-v1.2.json"), "utf8"));
+  assert.deepEqual(baseline.map((t) => t.name).sort(), [...NEW].sort());
+  const { json } = await rpc(BASE, "tools/list");
+  const live = JSON.parse(JSON.stringify(json.result.tools).replaceAll(JOBS, "/var/lib/ssh-mcp/jobs"));
+  for (const b of baseline) {
+    const t = live.find((x) => x.name === b.name);
+    if (b.name === "bash") {
+      assert.equal(t.inputSchema.properties.quiet.type, "boolean");
+      assert.ok(!(t.inputSchema.required ?? []).includes("quiet"));
+      delete t.inputSchema.properties.quiet;
+    }
+    assert.deepEqual(t, b, `tool ${b.name} changed`);
+  }
+});
+
+test("I1 initialize: version 1.3.0 and short instructions that point every model at batch / bulk calls", async () => {
+  const { json } = await rpc(BASE, "initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "e2e", version: "1" } });
+  assert.equal(json.result.serverInfo.version, "1.3.0");
+  const ins = json.result.instructions;
+  assert.equal(typeof ins, "string");
+  for (const word of ["batch", "files", "ssh_exec_many", "quiet", "run_in_background"]) assert.ok(ins.includes(word), `instructions do not mention ${word}`);
+  assert.ok(ins.length < 1500, `instructions are ${ins.length} chars`);
+});
+
+// One block per op: "=== [i/n] <kind> <label> | ok|FAILED|skipped [| 0.12s] ===", then the op's output; last line is the summary.
+function parseBatch(text) {
+  const heads = [...text.matchAll(/^=== \[(\d+)\/(\d+)\] (bash|read|write|edit) (.*?) \| (ok|FAILED|skipped)(?: \| (\d+\.\d\d)s)? ===\n/gm)];
+  const sum = text.match(/^=== batch: (.*?) \| (\d+\.\d\d)s ===$/m);
+  assert.ok(sum, `no summary line: ${text.slice(-300)}`);
+  const ops = heads.map((m, k) => ({ i: Number(m[1]), n: Number(m[2]), kind: m[3], label: m[4], status: m[5],
+    body: text.slice(m.index + m[0].length, k + 1 < heads.length ? heads[k + 1].index : sum.index) }));
+  return { ops, summary: sum[1] };
+}
+const SEQ_BYTES = 108_894; // bytes printed by `seq 1 20000`
+
+for (const [i, host] of HOSTS.entries()) {
+  test(`Q1 bash quiet ${host}: only the end of the output comes back, the rest stays on the host`, async () => {
+    assert.equal((await call("bash", { host, quiet: true, command: "echo hi" })).text, "hi\n");            // small output: unchanged
+    assert.equal((await call("bash", { host, quiet: true, command: "true" })).text, "(no output)");
+    const ok = await call("bash", { host, quiet: true, command: "seq 1 20000" });
+    assert.equal(ok.isError, false, ok.text.slice(0, 300));
+    const m = ok.text.match(/^\.\.\.\[(\d+) bytes omitted - full output saved on the host: (\S+)\]\.\.\.\n/);
+    assert.ok(m, ok.text.slice(0, 200));
+    assert.equal(Number(m[1]), SEQ_BYTES - 2000);
+    assert.equal(statSync(m[2]).size, SEQ_BYTES);
+    assert.equal(ok.text.length, m[0].length + 2000);
+    assert.ok(ok.text.endsWith("19999\n20000\n"));
+    const bad = await call("bash", { host, quiet: true, command: "seq 1 20000; exit 7" });                 // a failure shows more of the end
+    const mb = bad.text.match(/^\.\.\.\[(\d+) bytes omitted - full output saved on the host: (\S+)\]\.\.\.\n/);
+    assert.equal(Number(mb[1]), SEQ_BYTES - 8000);
+    assert.ok(bad.text.endsWith("20000\n[exit code: 7]"), bad.text.slice(-60));
+    const loud = await call("bash", { host, command: "seq 1 20000" });                                     // without quiet: as before
+    assert.ok(loud.text.length > 97_000 && loud.text.startsWith("1\n2\n3\n"));
+  });
+
+  test(`B1 batch ${host}: write, edit, bash and read in ONE call, in order, one block each`, async () => {
+    const d = P(`batch-${host}`);
+    const r = await call("batch", { host, ops: [
+      { write: { files: [{ file_path: `${d}/a.txt`, content: "alpha\nbeta\n" }, { file_path: `${d}/sub/b.txt`, content: "one\n" }] } },
+      { edit: { file_path: `${d}/a.txt`, old_string: "beta", new_string: "BETA" } },
+      { bash: { command: "cat a.txt; echo err >&2", cwd: d } },
+      { read: { file_path: `${d}/sub/b.txt` } },
+    ] });
+    assert.equal(r.isError, false, r.text);
+    const b = parseBatch(r.text);
+    assert.deepEqual(b.ops.map((o) => [o.i, o.n, o.kind, o.status]), [[1, 4, "write", "ok"], [2, 4, "edit", "ok"], [3, 4, "bash", "ok"], [4, 4, "read", "ok"]]);
+    assert.deepEqual(b.ops.map((o) => o.label), ["2 files", `${d}/a.txt`, "cat a.txt; echo err >&2", `${d}/sub/b.txt`]);
+    assert.match(b.ops[0].body, /^Wrote 11 bytes to .*\n.*\n2 files written, 15 bytes\n$/);
+    assert.match(b.ops[1].body, /: 1 replacement\n--- lines 1-\d after the edit ---\n     1\talpha\n     2\tBETA\n/);
+    assert.equal(b.ops[2].body, "alpha\nBETA\nerr\n");
+    assert.equal(b.ops[3].body, "     1\tone\n");
+    assert.equal(b.summary, "4 ok, 0 failed, 0 skipped");
+    assert.equal(readFileSync(`${d}/a.txt`, "utf8"), "alpha\nBETA\n");
+    const one = await call("batch", { host, ops: [{ bash: { command: "true", description: "do nothing" } }] });
+    assert.deepEqual(parseBatch(one.text).ops.map((o) => [o.label, o.body]), [["do nothing", "(no output)\n"]]);
+  });
+
+  test(`B2 batch ${host}: stops at the first failure - later ops are skipped and change nothing`, async () => {
+    const d = P(`batch-stop-${host}`);
+    mkdirSync(d);
+    writeFileSync(`${d}/keep.txt`, "keep\n");
+    const r = await call("batch", { host, ops: [
+      { bash: { command: "echo one" } },
+      { bash: { command: "echo two; exit 3" } },
+      { write: { file_path: `${d}/never.txt`, content: "x" } },
+      { bash: { command: `touch ${d}/never2.txt` } },
+    ] });
+    assert.equal(r.isError, true, r.text);
+    const b = parseBatch(r.text);
+    assert.deepEqual(b.ops.map((o) => o.status), ["ok", "FAILED", "skipped", "skipped"]);
+    assert.equal(b.ops[1].body, "two\n[exit code: 3]\n");
+    assert.equal(b.ops[2].body + b.ops[3].body, "");
+    assert.equal(b.summary, "1 ok, 1 failed, 2 skipped");
+    assert.deepEqual(readdirSync(d), ["keep.txt"]);
+    // every kind of op can be the one that stops it
+    for (const [op, why] of [
+      [{ edit: { file_path: `${d}/keep.txt`, old_string: "absent", new_string: "x" } }, /old_string not found/],
+      [{ read: { file_path: `${d}/missing.txt` } }, /File does not exist/],
+      [{ write: { file_path: "relative.txt", content: "x" } }, /file_path must be absolute/],
+      [{ bash: { command: "pwd", cwd: `${d}/no-such-dir` } }, /No such directory/],
+    ]) {
+      const s = parseBatch((await call("batch", { host, ops: [op, { bash: { command: `touch ${d}/never3.txt` } }] })).text);
+      assert.deepEqual(s.ops.map((o) => o.status), ["FAILED", "skipped"], JSON.stringify(op));
+      assert.match(s.ops[0].body, why);
+    }
+    assert.deepEqual(readdirSync(d), ["keep.txt"]);
+    assert.equal(readFileSync(`${d}/keep.txt`, "utf8"), "keep\n");
+  });
+
+  test(`B3 batch ${host}: stop_on_error false runs everything and reports each failure; a timeout is a failure`, async () => {
+    const r = await call("batch", { host, stop_on_error: false, ops: [
+      { bash: { command: "echo a" } },
+      { bash: { command: "echo b; sleep 20", timeout: 1000 } },
+      { read: { file_path: P("definitely-missing.txt") } },
+      { bash: { command: "echo d" } },
+    ] });
+    assert.equal(r.isError, true);
+    const b = parseBatch(r.text);
+    assert.deepEqual(b.ops.map((o) => o.status), ["ok", "FAILED", "FAILED", "ok"]);
+    assert.equal(b.ops[1].body, "b\n[timed out after 1s - exit code: 124]\n");
+    assert.equal(b.ops[3].body, "d\n");
+    assert.equal(b.summary, "2 ok, 2 failed, 0 skipped");
+  });
+
+  test(`B4 batch ${host}: bash ops of one batch share a working directory; cwd and session work as in bash`, async () => {
+    const d = P(`batch-cwd-${host}`);
+    mkdirSync(`${d}/sub`, { recursive: true });
+    const b = parseBatch((await call("batch", { host, cwd: d, ops: [
+      { bash: { command: "pwd" } },
+      { bash: { command: "cd sub" } },
+      { read: { file_path: P("hosts.json"), limit: 1 } },
+      { bash: { command: "pwd" } },
+    ] })).text);
+    assert.deepEqual(b.ops.map((o) => o.status), ["ok", "ok", "ok", "ok"]);
+    assert.equal(b.ops[0].body, `${d}\n`);                       // starts in the batch cwd, no note because nothing moved
+    assert.equal(b.ops[1].body, `[cwd: ${d}/sub]\n`);           // cd is noted ...
+    assert.equal(b.ops[3].body, `${d}/sub\n`);                  // ... and carries to the next bash op
+    // nothing leaks out of the batch
+    assert.equal((await call("bash", { host, command: "pwd" })).text, process.env.HOME + "\n");
+    assert.equal(parseBatch((await call("batch", { host, ops: [{ bash: { command: "pwd" } }] })).text).ops[0].body, process.env.HOME + "\n");
+    // a named session is the same one the bash tool uses
+    const s = `batch-sess-${host}`;
+    await call("batch", { host, session: s, ops: [{ bash: { command: `cd ${d}` } }] });
+    assert.equal((await call("bash", { host, session: s, command: "pwd" })).text, `${d}\n`);
+    assert.equal(parseBatch((await call("batch", { host, session: s, ops: [{ bash: { command: "pwd" } }] })).text).ops[0].body, `${d}\n`);
+    // an op's own cwd wins for that op
+    assert.equal(parseBatch((await call("batch", { host, cwd: d, ops: [{ bash: { command: "pwd", cwd: TMP } }] })).text).ops[0].body, `${TMP}\n`);
+  });
+
+  test(`B6 batch ${host}: all ops share one output budget; what is cut stays in full on the host`, async () => {
+    const r = await call("batch", { host, ops: [
+      { bash: { command: "echo small" } },
+      ...Array.from({ length: 4 }, () => ({ bash: { command: "head -c 60000 /dev/zero | tr '\\0' x" } })),
+    ] });
+    assert.equal(r.isError, false, r.text.slice(0, 300));
+    assert.ok(r.text.length < MAX_OUT + 1500, `len ${r.text.length}`);
+    const b = parseBatch(r.text);
+    assert.equal(b.ops[0].body, "small\n");
+    for (const o of b.ops.slice(1)) {
+      assert.ok(o.body.length > 15_000 && o.body.length < 21_000, `body ${o.body.length}`);
+      const m = o.body.match(/\[(\d+) bytes omitted - full output saved on the host: (\S+)\]/);
+      assert.ok(m, o.body.slice(0, 100));
+      assert.equal(statSync(m[2]).size, 60_000);
+    }
+  });
+
+  test(`B7 batch ${host}: an image read, a background job and a quiet command inside one batch`, async () => {
+    const png = P(`batch-dot-${host}.png`);
+    writeFileSync(png, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64"));
+    const res = await tool("batch", { host, ops: [
+      { read: { file_path: png } },
+      { bash: { command: `sleep ${61337 + i}`, run_in_background: true } },
+      { bash: { command: "seq 1 20000", quiet: true } },
+    ] });
+    assert.equal(!!res.isError, false);
+    assert.deepEqual(res.content.map((c) => c.type), ["text", "image", "text"]);
+    assert.equal(res.content[1].mimeType, "image/png");
+    const b = parseBatch(res.content.filter((c) => c.type === "text").map((c) => c.text).join(""));
+    assert.deepEqual(b.ops.map((o) => o.status), ["ok", "ok", "ok"]);
+    const jobId = field(b.ops[1].body, "jobId");
+    assert.match(jobId, /^\d{8}-\d{6}-[0-9a-f]{6}$/, b.ops[1].body);
+    assert.equal(field((await job(host, jobId, "kill")).text, "state"), "exited");
+    assert.ok(b.ops[2].body.length < 2300 && b.ops[2].body.endsWith("19999\n20000\n"), `quiet body ${b.ops[2].body.length}`);
+  });
+}
+
+test("B5 batch validation: each op is exactly one of bash/read/write/edit; nothing runs when the request is malformed", async () => {
+  const f = P("batch-validation.txt");
+  const w = { write: { file_path: f, content: "x" } };
+  const none = await call("batch", { host: "local", ops: [w, {}] });
+  assert.equal(none.isError, true);
+  assert.match(none.text, /op #2: .*exactly one of bash, read, write, edit/);
+  const two = await call("batch", { host: "local", ops: [w, { bash: { command: "true" }, read: { file_path: f } }] });
+  assert.match(two.text, /op #2: .*exactly one of bash, read, write, edit/);
+  assert.equal((await call("batch", { host: "nope", ops: [w] })).isError, true);
+  assert.match((await call("batch", { host: "nope", ops: [w] })).text, /Unknown host "nope"/);
+  assert.equal((await call("batch", { host: "local", ops: [] })).isError, true);
+  assert.equal((await call("batch", { host: "local", ops: Array.from({ length: 31 }, () => w) })).isError, true);
+  assert.equal((await call("batch", { host: "local", ops: [w, { bash: { command: "" } }] })).isError, true);
+  assert.equal(existsSync(f), false, "a malformed batch must not run its first ops");
+});
