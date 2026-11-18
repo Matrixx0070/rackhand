@@ -34,21 +34,34 @@ const OLD = ["list_hosts", "ssh_exec", "sftp_read", "sftp_write", "sftp_list", "
 const NEW = ["bash", "read", "write", "edit", "bridge"]; // v1.2
 const V13 = ["batch"]; // v1.3
 const V14 = ["audit"]; // v1.4
+const V15 = ["add_host"]; // v1.5
+const VERSION = "1.5.0";
+const ALL_TOOLS = [...OLD, ...NEW, ...V13, ...V14, ...V15];
 const HOSTS = ["local", "remote"];
 const MAX_OUT = 100_000;
 const SERVER_LOG = path.join(tmpdir(), `ssh-mcp-e2e-server-${process.getuid?.() ?? 0}.log`); // stdout+stderr of the servers under test (one per user)
 writeFileSync(SERVER_LOG, "");
 
-let sshd, servers = [];
+let sshd, sshd2, servers = [];
 
-function startSshd() {
+// authorizedFile: accept only the public keys listed in that file (read on every login); without it, any key.
+function startSshd({ authorizedFile } = {}) {
   const host = utils.generateKeyPairSync("ed25519");
   const client = utils.generateKeyPairSync("ed25519");
-  writeFileSync(path.join(TMP, "client"), client.private, { mode: 0o600 });
+  if (!authorizedFile) writeFileSync(path.join(TMP, "client"), client.private, { mode: 0o600 });
   const fp = "SHA256:" + createHash("sha256").update(utils.parseKey(host.private).getPublicSSH()).digest("base64").replace(/=+$/, "");
+  const stats = { logins: 0 }; // public-key login attempts this server was offered
   const srv = new Server({ hostKeys: [host.private] }, (c) => {
     const kids = new Set();
-    c.on("authentication", (ctx) => (ctx.method === "publickey" ? ctx.accept() : ctx.reject(["publickey"])));
+    c.on("authentication", (ctx) => {
+      if (ctx.method !== "publickey") return ctx.reject(["publickey"]);
+      stats.logins++;
+      if (!authorizedFile) return ctx.accept();
+      const allowed = (existsSync(authorizedFile) ? readFileSync(authorizedFile, "utf8") : "").split("\n").filter(Boolean).map((l) => utils.parseKey(l)).filter((k) => !(k instanceof Error));
+      const key = allowed.find((k) => k.type === ctx.key.algo && k.getPublicSSH().equals(ctx.key.data));
+      if (!key || (ctx.signature && key.verify(ctx.blob, ctx.signature, ctx.hashAlgo) !== true)) return ctx.reject(["publickey"]);
+      ctx.accept();
+    });
     c.on("ready", () => c.on("session", (accept) => {
       const session = accept();
       session.on("exec", (acc, _rej, info) => {
@@ -67,7 +80,7 @@ function startSshd() {
     c.on("close", () => { for (const k of kids) { k.stdin.destroy(); k.stdout.destroy(); k.stderr.destroy(); k.kill("SIGKILL"); } }); // like sshd: the session's pipes close
     c.on("error", () => {});
   });
-  return new Promise((res) => srv.listen(0, "127.0.0.1", () => res({ srv, port: srv.address().port, fp })));
+  return new Promise((res) => srv.listen(0, "127.0.0.1", () => res({ srv, port: srv.address().port, fp, stats })));
 }
 
 // Minimal SFTP subsystem backed by the local filesystem, enough for ssh2's readFile/writeFile/readdir.
@@ -151,6 +164,7 @@ const job = (host, jobId, action, extra = {}, base = BASE) => call("ssh_job", { 
 
 before(async () => {
   sshd = await startSshd();
+  sshd2 = await startSshd({ authorizedFile: path.join(TMP, "authorized_keys") }); // for add_host: a host that does not know the connector's key yet
   writeFileSync(path.join(TMP, "hosts.json"), JSON.stringify({
     local: { local: true },
     remote: { host: "127.0.0.1", port: sshd.port, username: "t", privateKeyPath: path.join(TMP, "client"), hostFingerprint: sshd.fp },
@@ -161,19 +175,28 @@ before(async () => {
 after(() => {
   for (const p of servers) p.kill("SIGKILL");
   sshd.srv.close();
+  sshd2.srv.close();
   for (const n of ["31337", "31338", "41337", "41338", "51337", "51338", "61337", "61338", "71337", "71338"]) pkill9(`sleep ${n}`);
   rmSync(TMP, { recursive: true, force: true });
 });
 
 // ───────────────────────── Regression: the 10 deployed tools ─────────────────────────
 
-test("R1 existing 10 tools: name/description/inputSchema identical to the deployed baseline", async () => {
+test("R1 existing 10 tools: name/description/inputSchema as in the deployed baseline (the command tools only gained the optional `confirm`)", async () => {
   const baseline = JSON.parse(readFileSync(path.join(ROOT, "test/baseline-tools.json"), "utf8"));
   assert.deepEqual(baseline.map((t) => t.name).sort(), [...OLD].sort());
   const { json } = await rpc(BASE, "tools/list");
   // the baseline was captured on production, where JOBS_DIR is the default; the test server uses a temp dir
   const live = JSON.parse(JSON.stringify(json.result.tools).replaceAll(JOBS, "/var/lib/ssh-mcp/jobs"));
-  for (const b of baseline) assert.deepEqual(live.find((t) => t.name === b.name), b, `tool ${b.name} changed`);
+  for (const b of baseline) {
+    const t = live.find((x) => x.name === b.name);
+    if (["ssh_exec", "ssh_exec_many", "ssh_spawn", "exec_code"].includes(b.name)) {
+      assert.equal(t.inputSchema.properties.confirm.type, "boolean", `${b.name} has no confirm`);
+      assert.ok(!(t.inputSchema.required ?? []).includes("confirm"));
+      delete t.inputSchema.properties.confirm;
+    } else assert.equal(t.inputSchema.properties?.confirm, undefined, `${b.name} must not have confirm`);
+    assert.deepEqual(t, b, `tool ${b.name} changed`);
+  }
 });
 
 test("R2 ssh_exec local: exit/stdout/stderr text format unchanged", async () => {
@@ -215,9 +238,9 @@ test("R7 ssh_exec keeps MAX_OUT truncation", async () => {
 
 // ───────────────────────── New tools ─────────────────────────
 
-test("N1 tools/list exposes exactly the 17 tools", async () => {
+test("N1 tools/list exposes exactly the 18 tools", async () => {
   const { json } = await rpc(BASE, "tools/list");
-  assert.deepEqual(json.result.tools.map((t) => t.name).sort(), [...OLD, ...NEW, ...V13, ...V14].sort());
+  assert.deepEqual(json.result.tools.map((t) => t.name).sort(), [...ALL_TOOLS].sort());
 });
 
 const splitBlocks = (text) => text.split(/\n\n(?==== \[)/).map((b) => {
@@ -742,7 +765,7 @@ test("G1 bridge tool mints a time-limited URL for sandbox shells", async () => {
 
 test("G2 bridge auth: only a valid, unexpired token opens /b/<token>/...", async () => {
   const good = `http://127.0.0.1:${PORT}/b/${signTok(now() + 600)}`;
-  assert.equal((await rpc(`${good}/mcp`, "tools/list")).json.result.tools.length, 17);
+  assert.equal((await rpc(`${good}/mcp`, "tools/list")).json.result.tools.length, ALL_TOOLS.length);
   assert.equal((await call("ssh_exec", { host: "local", command: "echo via-bridge" }, `${good}/mcp`)).text, "exit: 0\n--- stdout ---\nvia-bridge\n\n--- stderr ---\n");
   const expired = `http://127.0.0.1:${PORT}/b/${signTok(now() - 5)}`;
   const forged = `http://127.0.0.1:${PORT}/b/${(now() + 600).toString(36)}.${"0".repeat(32)}`;
@@ -832,7 +855,7 @@ test("G6 box CLI served by the connector: tools, exec, put/get, push/pull, call 
     pr.child.stdin.end(input);
     return (await pr).stdout;
   };
-  assert.deepEqual((await box(["tools"])).trim().split(/\s+/).sort(), [...OLD, ...NEW, ...V13, ...V14].sort());
+  assert.deepEqual((await box(["tools"])).trim().split(/\s+/).sort(), [...ALL_TOOLS].sort());
   assert.equal(await box(["exec", "--", "echo hi; echo e >&2"]), "hi\ne\n");
   assert.equal(await box(["exec", "-C", TMP, "remote", "--", "pwd"]), TMP + "\n");
   assert.equal(await box(["exec", "--", "-"], {}, "cd /tmp\npwd\nexit 4\n").catch((e) => `${e.code}:${e.stdout}`), "4:/tmp\n"); // script from stdin
@@ -939,7 +962,7 @@ test("G10 a client that disconnects mid-download does not leave the transfer run
 
 // ═════════════════════════ v1.3: fewer round trips - batch, quiet output, server instructions ═════════════════════════
 
-test("V1 the five v1.2 tools are unchanged (bash only gained the optional `quiet`)", async () => {
+test("V1 the five v1.2 tools are unchanged (bash only gained the optional `quiet` and `confirm`)", async () => {
   const baseline = JSON.parse(readFileSync(path.join(ROOT, "test/baseline-tools-v1.2.json"), "utf8"));
   assert.deepEqual(baseline.map((t) => t.name).sort(), [...NEW].sort());
   const { json } = await rpc(BASE, "tools/list");
@@ -948,8 +971,8 @@ test("V1 the five v1.2 tools are unchanged (bash only gained the optional `quiet
     const t = live.find((x) => x.name === b.name);
     if (b.name === "bash") {
       assert.equal(t.inputSchema.properties.quiet.type, "boolean");
-      assert.ok(!(t.inputSchema.required ?? []).includes("quiet"));
-      delete t.inputSchema.properties.quiet;
+      assert.equal(t.inputSchema.properties.confirm.type, "boolean");
+      for (const k of ["quiet", "confirm"]) { assert.ok(!(t.inputSchema.required ?? []).includes(k)); delete t.inputSchema.properties[k]; }
     }
     assert.deepEqual(t, b, `tool ${b.name} changed`);
   }
@@ -957,10 +980,10 @@ test("V1 the five v1.2 tools are unchanged (bash only gained the optional `quiet
 
 test("I1 initialize: current version and short instructions that point every model at batch / bulk calls", async () => {
   const { json } = await rpc(BASE, "initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "e2e", version: "1" } });
-  assert.equal(json.result.serverInfo.version, "1.4.0");
+  assert.equal(json.result.serverInfo.version, VERSION);
   const ins = json.result.instructions;
   assert.equal(typeof ins, "string");
-  for (const word of ["batch", "files", "ssh_exec_many", "quiet", "run_in_background", "audit"]) assert.ok(ins.includes(word), `instructions do not mention ${word}`);
+  for (const word of ["batch", "files", "ssh_exec_many", "quiet", "run_in_background", "audit", "add_host"]) assert.ok(ins.includes(word), `instructions do not mention ${word}`);
   assert.ok(ins.length < 1500, `instructions are ${ins.length} chars`);
 });
 
@@ -1295,7 +1318,7 @@ test("A6 audit: the client address is the one the reverse proxy saw (right-most 
 test("A7 audit: a command is recorded BEFORE it runs, so one that kills the connector is still in the log; every start is recorded", async () => {
   const jobs = P("a7", "jobs"), file = P("a7", "audit", "audit.jsonl"), port = 18790, base = `http://127.0.0.1:${port}/mcp/${SECRET}`;
   const p = await startServer(port, { JOBS_DIR: jobs });
-  assert.deepEqual(auditLines(file).map((r) => [r.event, r.pid, r.version]), [["start", p.pid, "1.4.0"]]);
+  assert.deepEqual(auditLines(file).map((r) => [r.event, r.pid, r.version]), [["start", p.pid, VERSION]]);
   const gone = new Promise((res) => p.once("exit", res));
   await assert.rejects(call("bash", { host: "local", command: `kill -9 ${p.pid} # a7-killer` }, base));
   await gone;
@@ -1307,7 +1330,7 @@ test("A7 audit: a command is recorded BEFORE it runs, so one that kills the conn
   const shown = (await call("audit", { contains: "a7-killer" }, base)).text;
   assert.match(shown, new RegExp(`  bash  local  no result \\(still running, or the server stopped\\)  -  kill -9 ${p.pid} # a7-killer$`, "m"));
   assert.equal(auditLines(file).filter((r) => r.event === "start").length, 2);
-  assert.match((await call("audit", { contains: "server started" }, base)).text, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ  server started: v1\.4\.0, pid \d+$/m);
+  assert.match((await call("audit", { contains: "server started" }, base)).text, new RegExp(`^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\dZ  server started: v${VERSION.replaceAll(".", "\\.")}, pid \\d+$`, "m"));
 });
 
 test("A8 audit: the log rotates at its size limit and keeps a fixed number of old files", async () => {
@@ -1391,9 +1414,10 @@ test("A13 audit: every one of the tools leaves a record", async () => {
   await call("edit", { host: "local", file_path: f, old_string: "two", new_string: "three" });
   await call("batch", { host: "local", ops: [{ read: { file_path: f } }] });
   await call("bridge", {});
+  await call("add_host", { name: "a13-nowhere", host: "127.0.0.1", port: 1, username: "nobody" });
   await call("audit", { limit: 1 });
   const es = auditEntries().slice(from), names = (await rpc(BASE, "tools/list")).json.result.tools.map((t) => t.name);
-  assert.equal(names.length, 17);
+  assert.equal(names.length, ALL_TOOLS.length);
   for (const n of names) assert.ok(es.some((e) => e.tool === n && e.done), `no audit record for ${n}`);
   const of = (toolName) => es.find((e) => e.tool === toolName && !e.batch);
   assert.deepEqual([of("ssh_exec_many").what, of("ssh_exec_many").exits, of("ssh_exec_many").ok], ["a: true\nb: exit 2", [0, 2], false]);
@@ -1442,4 +1466,322 @@ test("A15 audit: a long command is masked first and cut to 2000 characters after
   const t0 = Date.now();                                           // a hostile 60 KB command must not stall the server
   assert.equal((await call("bash", { host: "local", command: `: ${"pass".repeat(15000)}` })).isError, false);
   assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`);
+});
+
+// ═════════════════════════ v1.5: tripwire - a few catastrophic commands need `confirm: true` ═════════════════════════
+// SAFETY OF THESE TESTS: every catastrophic command below is written so that it cannot do anything even if the
+// tripwire is broken and lets it through: it sits behind `false &&` or inside `if false`, or it is the `--help`
+// of a command (which only prints its help), or it targets /proc (where nothing can be deleted).
+
+const TRIPPED = /^Error: Refused by the tripwire: /;
+const TRIP_CASES = [
+  ["false && rm -rf /", /recursive delete of "\/"/],
+  ["false && rm -rf / home/user/old", /recursive delete of "\/"/],                    // the classic stray space
+  ["false && rm -fr /*", /recursive delete of "\/"/],
+  ["false && sudo rm -rf --no-preserve-root /", /recursive delete of "\/"/],
+  ["false && rm -rf ~", /recursive delete of "~"/],
+  ['false && rm -rf "$HOME"/', /recursive delete of "\$HOME"/],
+  ["false && rm -rf ${HOME}/*", /recursive delete of "\$\{HOME\}"/],
+  ["false && rm -r /etc", /recursive delete of "\/etc"/],
+  ["false && rm -Rf /usr/", /recursive delete of "\/usr"/],
+  ["false && rm --recursive --force /var/lib/*", /recursive delete of "\/var\/lib"/],
+  ["false && /bin/rm -rf /boot", /recursive delete of "\/boot"/],
+  ["false && rm -rf /{etc,usr}", /recursive delete of "\/etc"/],
+  ["if false; then rm -rf /; fi", /recursive delete of "\/"/],
+  ["false && bash -c 'rm -rf /'", /recursive delete of "\/"/],
+  ['false && sudo sh -lc "rm -rf /opt/*"', /recursive delete of "\/opt"/],
+  ["false && ssh -p 2222 -i /root/.ssh/id root@10.0.0.9 'rm -rf /'", /recursive delete of "\/"/],
+  ['false && eval "rm -rf /"', /recursive delete of "\/"/],
+  ["false && timeout 5 rm -rf /", /recursive delete of "\/"/],
+  ["false && nohup rm -rf / &", /recursive delete of "\/"/],
+  ["false && FOO=1 BAR=2 rm -rf /", /recursive delete of "\/"/],
+  ["false && sudo -u root rm -rf /", /recursive delete of "\/"/],
+  ["false && true; false && rm -rf /", /recursive delete of "\/"/],
+  ["false && chmod -R 777 /", /recursive chmod of "\/"/],
+  ["false && chown -R nobody:nogroup /etc", /recursive chown of "\/etc"/],
+  ["false && find / -delete", /find deletes everything under "\/"/],
+  ["false && find /etc -type f -exec rm {} +", /find deletes everything under "\/etc"/],
+  ["false && mkfs.ext4 /dev/sdb1", /mkfs\.ext4 formats \/dev\/sdb1/],
+  ["false && mkfs -t xfs /dev/nvme1n1", /mkfs formats \/dev\/nvme1n1/],
+  ["false && mkfs.ext4 -F \"$DEV\"", /mkfs\.ext4 formats \$DEV/],
+  ["false && wipefs -a /dev/sda", /wipefs wipes \/dev\/sda/],
+  ["false && bash <<'EOF'\nrm -rf /\nEOF", /recursive delete of "\/"/],             // a script fed to a shell
+  ["false && sudo -i <<EOF\nreboot\nEOF", /reboot stops or restarts the machine/],
+  ["false && ssh web-1 <<'EOF'\nset -e\nmkfs.ext4 /dev/sdb\nEOF", /mkfs\.ext4 formats \/dev\/sdb/],
+  ["false && dd if=/dev/zero of=/dev/sda bs=1M", /dd writes over the disk \/dev\/sda/],
+  ["false && cat image.iso > /dev/nvme0n1", /a redirect writes over the disk \/dev\/nvme0n1/],
+  ["false && echo x >/dev/sdb", /a redirect writes over the disk \/dev\/sdb/],
+  ["false && echo x | tee /dev/vda", /tee writes over the disk \/dev\/vda/],
+  ["false && shred -n 1 /dev/xvdf", /shred writes over the disk \/dev\/xvdf/],
+  ["false && shutdown -h now", /shutdown stops or restarts the machine/],
+  ["false && reboot", /reboot stops or restarts the machine/],
+  ["false && poweroff", /poweroff stops or restarts the machine/],
+  ["false && halt -p", /halt stops or restarts the machine/],
+  ["false && init 0", /init 0 stops or restarts the machine/],
+  ["false && systemctl poweroff", /systemctl poweroff stops or restarts the machine/],
+  ["false && sudo systemctl reboot", /systemctl reboot stops or restarts the machine/],
+  ["false && /sbin/reboot", /reboot stops or restarts the machine/],
+  ["false && :(){ :|:& };:", /a fork bomb/],
+  // the splitter keeps its place through here-documents, nested shells, arithmetic, brace lists and ${...}
+  ["false && cat <<EOF\nx\nEOF\nfalse && rm -rf /", /recursive delete of "\/"/],
+  ["false && cat <<EOF\nx\n  EOF\nrm -rf /tmp/in-the-text\nEOF\nfalse && reboot", /reboot stops or restarts the machine/],   // an indented EOF does not close <<EOF
+  ["false && cat <<-EOF\n\tx\n\tEOF\nfalse && reboot", /reboot stops or restarts the machine/],
+  ["false && bash -c \"bash -c 'bash -c \\\"reboot\\\"'\"", /reboot stops or restarts the machine/],
+  ["false && echo $((1 << 3)); false && rm -rf /", /recursive delete of "\/"/],
+  ["false && rm -rf /{usr/{bin,lib},tmp/x}", /recursive delete of "\/usr\/bin"/],
+  ["false && A=1 B=2 env C=3 nice -n 5 timeout -k 3 10 sudo -u root reboot", /reboot stops or restarts the machine/],
+  ['false && rm -rf ${CC:+"${CC}"} /', /recursive delete of "\/"/],
+  // ... and through the shell's nesting: quotes inside "$(...)", commands inside substitutions, `case` inside them
+  ["false && V=\"$(grep '\"version\"' package.json | cut -d '\"' -f4)\"\nfalse && reboot", /reboot stops or restarts the machine/],
+  ['false && echo "$(rm -rf /)"', /recursive delete of "\/"/],
+  ['false && echo ${X:-$(poweroff)}', /poweroff stops or restarts the machine/],
+  ["false && x=$(case $1 in a) echo 1;; esac); false && reboot", /reboot stops or restarts the machine/],
+  ['if false; then case "$1" in\n go) reboot;;\nesac; fi', /reboot stops or restarts the machine/],
+  ["false && diff <(ls) <(reboot)", /reboot stops or restarts the machine/],
+  // first in the command, and harmless by nature
+  ["shutdown --help", /shutdown stops or restarts the machine/],
+  ["reboot --help", /reboot stops or restarts the machine/],
+  ["poweroff --help", /poweroff stops or restarts the machine/],
+  ["halt --help", /halt stops or restarts the machine/],
+  ["mkfs.ext4 /dev/tw-no-such-device", /mkfs\.ext4 formats \/dev\/tw-no-such-device/],
+  ["rm -rf /proc", /recursive delete of "\/proc"/],
+];
+
+test("T1 tripwire: catastrophic commands are refused before anything runs, with the reason and the way to go ahead", async () => {
+  for (const [command, why] of TRIP_CASES) {
+    const r = await call("bash", { host: "local", command });
+    assert.equal(r.isError, true, command);
+    assert.match(r.text, TRIPPED, command);
+    assert.match(r.text, why, command);
+    assert.match(r.text, /Nothing was run\. .*confirm: true/, command);
+  }
+  assert.match((await call("bash", { host: "remote", command: "false && rm -rf /" })).text, TRIPPED); // other hosts too
+});
+
+test("T2 tripwire: ordinary commands are not touched - including ones that only mention or resemble the dangerous ones", async () => {
+  const d = P("tw");
+  mkdirSync(`${d}/sub/deep`, { recursive: true });
+  writeFileSync(`${d}/sub/f.txt`, "x");
+  const fine = [                                   // every one of these really runs: absolute temp paths and read-only commands only
+    `echo "rm -rf /"`,
+    `echo 'shutdown -h now' > ${d}/note.txt`,
+    `printf '%s\n' reboot poweroff`,
+    `rm -rf ${d}/sub/deep`,
+    `rm -rf ${d}/sub/*`,
+    `rm -f ${d}/nothing-here`,
+    `rm -rf /tmp/tw-does-not-exist-${hex()}`,
+    `rm -rf /var/lib/tw-does-not-exist-${hex()}/cache`,
+    `grep -r shutdown ${d} || true`,
+    `dd if=/dev/zero of=${d}/zero.bin bs=1 count=1 2>/dev/null`,
+    `echo x > /dev/null`,
+    `ls /etc > ${d}/ls.txt`,
+    `chmod -R 755 ${d}`,
+    `find ${d} -name '*.nope' -delete`,
+    `cat > ${d}/script.sh <<'EOF'\nrm -rf /\nshutdown -h now\nmkfs.ext4 /dev/sda1\nEOF`,
+    `# rm -rf /\necho comment-ok`,
+    `systemctl status reboot.target >/dev/null 2>&1 || true`,
+    `man shutdown >/dev/null 2>&1 || true`,
+    `test -d /etc && echo etc-exists`,
+    `echo "$(echo nested) and \`echo backticks\`"`,
+    `case reboot in\n  reboot|halt) echo case-ok;;\n  shutdown) echo no;;\nesac`,
+    `echo $((1 << 3))\necho after-shift`,
+    `mkdir -p ${d}/{keep,old} && rm -rf ${d}/{old,gone}`,
+  ];
+  for (const command of fine) {
+    const r = await call("bash", { host: "local", command });
+    assert.equal(r.isError, false, `${command}\n${r.text}`);
+    assert.doesNotMatch(r.text, /tripwire/, command);
+  }
+  assert.equal(readFileSync(`${d}/script.sh`, "utf8"), "rm -rf /\nshutdown -h now\nmkfs.ext4 /dev/sda1\n");
+  assert.deepEqual(readdirSync(`${d}/sub`), []);
+  assert.deepEqual([existsSync(`${d}/keep`), existsSync(`${d}/old`)], [true, false]);
+
+  // Routine admin work that only looks alarming. None of these runs: each sits inside `if false`.
+  const routine = [
+    "rm -rf node_modules dist .cache", "rm -rf /opt/app/releases/2024-01-01", "rm -rf /home/deploy/app/tmp/*", "rm -rf /var/log/myapp/*.gz", "rm -rf /var/lib/apt/lists/*",
+    "rm -rf /usr/local/go && tar -C /usr/local -xzf go.tar.gz", "rm -rf /usr/local/{go,node}", "rm -rf /var/{cache,tmp}/myapp", "rm -r /etc/nginx/sites-enabled/old.conf",
+    "rm -f /etc/nginx/conf.d/default.conf", 'rm -rf "$BUILD_DIR"/*', "rm -rf ./build", "rm -rf ~/projects/old-app", "rm -rf $HOME/.cache/pip", "rm -rf /tmp/*",
+    "chown -R www-data:www-data /var/www/html", 'chown -R "$USER":"$USER" ~', "chown -R deploy:deploy /opt /srv", "chmod -R u+rwX /home/deploy/app",
+    "find /var/log -name '*.gz' -mtime +30 -delete", "find / -name '*.pyc' -delete", "find /home -name .DS_Store -delete", "find / -name '*.conf' 2>/dev/null | head",
+    "dd if=/dev/sda of=/root/backup.img bs=1M", "dd if=/dev/zero of=/swapfile bs=1M count=1024 && mkswap /swapfile && swapon /swapfile", "mkfs.ext4 -F disk.img", "wipefs /dev/sda",
+    "lsblk -f /dev/sda; fdisk -l /dev/nvme0n1; smartctl -a /dev/sda", "mount /dev/sdb1 /mnt/data && umount /mnt/data",
+    "systemctl restart nginx && systemctl status nginx", "shutdown -c", "command -v reboot", "which shutdown poweroff", "docker exec web rm -rf /app/cache", "kubectl delete pod web-1",
+    "git clean -fdx", "apt-get -y autoremove && apt-get clean", "tar -czf /root/etc-backup.tgz /etc", "rsync -a --delete /srv/app/ /srv/backup/app/",
+    "journalctl -u nginx --since '-1h' | grep -i 'shutdown\\|reboot'", "awk '/halt/ {print}' /var/log/syslog", "sed -i 's/poweroff/reboot/' notes.txt",
+    'for s in reboot halt; do echo "$s"; done', 'case "$1" in\n  start) echo start;;\n  reboot|halt) echo power;;\n  shutdown) echo down;;\nesac', "x=$(( (2 + 3) * 4 )); echo $x",
+    "python3 - <<'PY'\nimport os\nprint(\"rm -rf /\")\nPY", "cat <<EOF | tee notes.txt\nrm -rf /\nreboot\nEOF",
+    'git commit -m "$(cat <<\'EOF\'\nFix "reboot" handling\n\nreboot now waits; rm -rf / is "refused"\nEOF\n)"',
+    "curl -fsSL https://example.com/install.sh | bash",
+    "V=\"$(grep '\"version\"' package.json | cut -d '\"' -f4)\"\necho \"done; reboot to apply\"",   // quotes inside "$(...)" must not turn the next string into commands
+    'rm -rf "$(pwd)"/*', "rm -rf $(mktemp -d)/", 'if [[ "$cmd" =~ ^(reboot|shutdown)$ ]]; then echo blocked; fi', 'cmds=(reboot halt "shutdown -h now"); echo ${#cmds[@]}',
+    'x="$(case "$1" in reboot) echo "a)b";; *) echo c;; esac)"\necho "y; halt"', "N=${N:-$(wc -l ${F} | awk '{print $1}')}\necho \"a; halt b\"", "echo $'it\\'s; reboot'",
+    "x=\"$(cat <<EOF\nit's \"x\"; reboot\nEOF\n)\"\necho \"q; halt\"",
+    `echo 'abc' "it's" # rm -rf /`, 'echo "${CC:+"${CC}"}"; echo "$(echo "a b")"', "f() { echo hi; }; f", "rm -rf /tmp/build/{a,b} /srv/app/{cache,tmp}/old",
+  ];
+  for (const command of routine) {
+    const r = await call("bash", { host: "local", command: `if false; then\n${command}\nfi` });
+    assert.equal(r.isError, false, `${command}\n${r.text}`);
+    assert.doesNotMatch(r.text, /tripwire/, command);
+  }
+});
+
+test("T3 tripwire: confirm: true runs the command; both the refusal and the confirmation are in the audit log", async () => {
+  const command = "false && reboot; echo ran-anyway";
+  const no = await call("bash", { host: "local", command });
+  assert.match(no.text, TRIPPED);
+  const yes = await call("bash", { host: "local", command, confirm: true });
+  assert.deepEqual([yes.isError, yes.text], [false, "ran-anyway\n"]);
+  const [refused, confirmed] = auditEntries().filter((e) => e.what === command).slice(-2);
+  assert.deepEqual([refused.ok, refused.tripwire, refused.exit ?? null], [false, "reboot stops or restarts the machine", null]);
+  assert.match(refused.err, /^Refused by the tripwire/);
+  assert.deepEqual([confirmed.ok, confirmed.confirmed, confirmed.exit], [true, "reboot stops or restarts the machine", 0]);
+  assert.equal((await call("bash", { host: "local", command: "echo plain", confirm: true })).text, "plain\n"); // confirm on an ordinary command changes nothing
+  const shown = (await call("audit", { contains: "ran-anyway", limit: 2 })).text.split("\n").slice(1); // and the audit tool says it in plain words
+  assert.match(shown[0], /  bash  local  REFUSED by the tripwire: reboot stops or restarts the machine  0\.\d\ds  false && reboot; echo ran-anyway$/);
+  assert.match(shown[1], /  bash  local  ok \(confirmed: reboot stops or restarts the machine\)  \d+\.\d\ds  false && reboot; echo ran-anyway$/);
+});
+
+test("T4 tripwire: every way of running a command is covered - ssh_exec, ssh_exec_many, ssh_spawn, exec_code, batch, the bridge and the box CLI", async () => {
+  const d = P("tw-all"), marker = `${d}/must-not-exist`;
+  mkdirSync(d);
+  const bad = "false && shutdown -h now";
+  assert.match((await call("ssh_exec", { host: "local", command: bad })).text, TRIPPED);
+  assert.equal((await call("ssh_exec", { host: "local", command: `${bad}; echo exec-confirmed`, confirm: true })).text, "exit: 0\n--- stdout ---\nexec-confirmed\n\n--- stderr ---\n");
+
+  const many = await call("ssh_exec_many", { host: "local", commands: [{ id: "one", command: `touch ${marker}` }, { id: "two", command: bad }] });
+  assert.match(many.text, /^Error: Refused by the tripwire: \[two\] shutdown stops or restarts the machine\./);
+  assert.equal(existsSync(marker), false, "none of the commands may run when one is refused");
+  assert.match((await call("ssh_exec_many", { host: "local", confirm: true, commands: [{ id: "one", command: "echo many-confirmed" }, { id: "two", command: bad }] })).text, /=== \[one\] exit: 0 .*\n--- stdout ---\nmany-confirmed/);
+
+  assert.match((await call("ssh_spawn", { host: "local", command: bad })).text, TRIPPED);
+  const spawned = await call("ssh_spawn", { host: "local", command: `${bad}; echo spawn-confirmed`, confirm: true });
+  assert.match((await job("local", field(spawned.text, "jobId"), "wait", { timeout_sec: 20 })).text, /spawn-confirmed/);
+
+  assert.match((await call("exec_code", { host: "local", language: "bash", code: "if false; then\n  mkfs.ext4 /dev/sdz9\nfi\n" })).text, /^Error: Refused by the tripwire: mkfs\.ext4 formats \/dev\/sdz9\./);
+  assert.match((await call("exec_code", { host: "local", language: "bash", code: "if false; then\n  mkfs.ext4 /dev/sdz9\nfi\necho code-confirmed\n", confirm: true })).text, /code-confirmed/);
+  assert.match((await call("exec_code", { host: "local", language: "python", code: 'print("rm -rf / is only text here")' })).text, /rm -rf \/ is only text here/); // shell only
+
+  const b = parseBatch((await call("batch", { host: "local", ops: [{ write: { file_path: `${d}/a.txt`, content: "x" } }, { bash: { command: "false && poweroff" } }, { bash: { command: `touch ${marker}` } }] })).text);
+  assert.deepEqual(b.ops.map((o) => o.status), ["ok", "FAILED", "skipped"]);
+  assert.match(b.ops[1].body, TRIPPED);
+  assert.equal(existsSync(marker), false);
+  const b2 = parseBatch((await call("batch", { host: "local", ops: [{ bash: { command: "false && poweroff; echo batch-confirmed", confirm: true } }] })).text);
+  assert.deepEqual(b2.ops.map((o) => [o.status, o.body]), [["ok", "batch-confirmed\n"]]);
+
+  const url = (await call("bridge", { ttl_hours: 1 })).text.match(/(http:\/\/\S+\/b\/[0-9a-z]+\.[0-9a-f]{32})/)[1];
+  const post = (q, body) => fetch(`${url}/exec/local${q}`, { method: "POST", headers: { "Content-Type": "text/plain" }, body });
+  const refused = await post("", "false && reboot");
+  assert.equal(refused.status, 409);
+  assert.match(await refused.text(), /^Refused by the tripwire: reboot stops or restarts the machine\. Nothing was run\..*confirm=1/);
+  const went = await post("?confirm=1", "false && reboot; echo bridge-confirmed");
+  assert.deepEqual([went.status, went.headers.get("x-exit-code"), await went.text()], [200, "0", "bridge-confirmed\n"]);
+
+  const cli = P("box-tw");
+  writeFileSync(cli, await (await fetch(`${url}/cli`)).text(), { mode: 0o755 });
+  const run = promisify(execFile);
+  const no = await run("bash", [cli, "exec", "--", "false && reboot"], { encoding: "utf8" }).catch((e) => e);
+  assert.equal(no.code, 255);
+  assert.match(no.stderr, /Refused by the tripwire.*box exec -y/s);
+  assert.equal((await run("bash", [cli, "exec", "-y", "--", "false && reboot; echo cli-confirmed"], { encoding: "utf8" })).stdout, "cli-confirmed\n");
+});
+
+test("T5 TRIPWIRE=off: the server does not look at commands at all", async () => {
+  const port = 18794, base = `http://127.0.0.1:${port}/mcp/${SECRET}`;
+  await startServer(port, { JOBS_DIR: P("t5", "jobs"), TRIPWIRE: "off" });
+  assert.equal((await call("bash", { host: "local", command: "false && reboot; echo tripwire-off" }, base)).text, "tripwire-off\n");
+});
+
+// ═════════════════════════ v1.5: add_host - connect another server without editing hosts.json by hand ═════════════════════════
+
+test("H1 add_host: the first call creates the connector's key and says how to authorize it - nothing is added yet", async () => {
+  const args = { name: "web-1", host: "127.0.0.1", port: sshd2.port, username: "deploy" };
+  const r = await call("add_host", args);
+  assert.equal(r.isError, false, r.text);
+  assert.match(r.text, /^Not added yet: /);
+  const pub = readFileSync(P("keys", "id_ed25519.pub"), "utf8").trim();
+  assert.match(pub, /^ssh-ed25519 AAAA\S+ ssh-mcp@\S+$/);
+  assert.ok(r.text.includes(pub), "the public key to authorize is shown");
+  assert.match(r.text, /authorized_keys/);
+  assert.ok(r.text.includes(sshd2.fp), "the fingerprint of the host key is shown, so it can be checked");
+  assert.match(r.text, /ssh_host_ed25519_key\.pub/);
+  assert.ok(r.text.includes(`fingerprint: "${sshd2.fp}"`), "the next call is told to pass the fingerprint it was shown");
+  assert.equal("web-1" in JSON.parse(readFileSync(P("hosts.json"), "utf8")), false);
+  assert.deepEqual([statSync(P("keys")).mode & 0o777, statSync(P("keys", "id_ed25519")).mode & 0o777], [0o700, 0o600]);
+  assert.ok((await call("add_host", args)).text.includes(pub), "the same key every time");
+});
+
+test("H2 add_host: once the key is authorized the host is tested, its host key pinned, and it works at once", async () => {
+  const before = readFileSync(P("hosts.json"), "utf8"), key = P("keys", "id_ed25519");
+  appendFileSync(P("authorized_keys"), readFileSync(`${key}.pub`, "utf8"));
+  const r = await call("add_host", { name: "web-1", host: "127.0.0.1", port: sshd2.port, username: "deploy" });
+  assert.equal(r.isError, false, r.text);
+  assert.match(r.text, new RegExp(`^Added host "web-1": deploy@127\\.0\\.0\\.1:${sshd2.port}\\n`));
+  assert.ok(r.text.includes(sshd2.fp));
+  assert.match(r.text, /logged in as \S+ on \S+/);
+  const hosts = JSON.parse(readFileSync(P("hosts.json"), "utf8"));
+  assert.deepEqual(hosts["web-1"], { host: "127.0.0.1", port: sshd2.port, username: "deploy", privateKeyPath: key, hostFingerprint: sshd2.fp });
+  assert.deepEqual([hosts.local, hosts.remote], [JSON.parse(before).local, JSON.parse(before).remote], "the other hosts are untouched");
+  assert.equal(statSync(P("hosts.json")).mode & 0o777, 0o600);
+  assert.equal(readFileSync(P("hosts.json.bak"), "utf8"), before, "the previous file is kept as hosts.json.bak");
+  assert.equal((await call("ssh_exec", { host: "web-1", command: "echo via-new-host" })).text, "exit: 0\n--- stdout ---\nvia-new-host\n\n--- stderr ---\n");
+  assert.match((await call("list_hosts", {})).text, new RegExp(`^web-1: deploy@127\\.0\\.0\\.1:${sshd2.port}$`, "m"));
+});
+
+test("H3 add_host: refuses what it should - an existing name, a host key that is not the expected one, a host it cannot reach", async () => {
+  const at = { host: "127.0.0.1", port: sshd2.port, username: "deploy" };
+  const names = () => Object.keys(JSON.parse(readFileSync(P("hosts.json"), "utf8")));
+  const taken = await call("add_host", { name: "web-1", ...at });
+  assert.deepEqual([taken.isError, /already exists.*replace: true/.test(taken.text)], [true, true], taken.text);
+  assert.equal((await call("add_host", { name: "local", ...at })).isError, true);
+  const replaced = await call("add_host", { name: "web-1", ...at, username: "other", replace: true });
+  assert.match(replaced.text, /^Added host "web-1": other@/);
+  assert.equal(JSON.parse(readFileSync(P("hosts.json"), "utf8"))["web-1"].username, "other");
+
+  const offered = sshd2.stats.logins;
+  const wrong = await call("add_host", { name: "web-2", ...at, fingerprint: `SHA256:${"A".repeat(43)}` });
+  assert.equal(wrong.isError, true);
+  assert.match(wrong.text, /does not match/);
+  assert.equal(sshd2.stats.logins, offered, "no login is even tried against a server that presents another host key");
+  assert.ok(wrong.text.includes(sshd2.fp), "it says which key the server presented");
+  assert.ok(!names().includes("web-2"));
+  assert.match((await call("add_host", { name: "web-2", ...at, fingerprint: sshd2.fp })).text, /^Added host "web-2"/);
+
+  const dead = await call("add_host", { name: "web-3", host: "127.0.0.1", port: 1, username: "deploy" });
+  assert.equal(dead.isError, true);
+  assert.match(dead.text, /Cannot reach 127\.0\.0\.1:1/);
+  assert.ok(!names().includes("web-3"));
+  for (const bad of [{ name: "bad name!" }, { name: "ok", host: "bad host;rm" }, { name: "ok", username: "bad user" }, { name: "ok", port: 70000 }])
+    assert.equal((await call("add_host", { name: "x", ...at, ...bad })).isError, true, JSON.stringify(bad));
+  assert.deepEqual(names(), ["local", "remote", "web-1", "web-2"]);
+});
+
+test("H4 add_host: its calls are in the audit log, and the private key never leaves the key file", async () => {
+  const es = auditEntries().filter((e) => e.tool === "add_host" && e.what?.startsWith("web-"));
+  assert.ok(es.length >= 6);
+  assert.equal(es[0].what, `web-1 = deploy@127.0.0.1:${sshd2.port}`);
+  assert.deepEqual([es[0].ok, es[0].added], [true, false]);
+  assert.ok(es.some((e) => e.added === true && e.what.startsWith("web-1 = deploy@")));
+  assert.ok(es.some((e) => e.ok === false && e.what.startsWith("web-3 = ")));
+  const shown = (await call("audit", { contains: "add_host", limit: 100 })).text;
+  assert.match(shown, /  add_host  -  ok \(not added yet\)  \d+\.\d\ds  web-1 = deploy@/);
+  assert.match(shown, /  add_host  -  ok \(added\)  \d+\.\d\ds  web-1 = deploy@/);
+  const body = readFileSync(P("keys", "id_ed25519"), "utf8").split("\n").filter((l) => l && !l.startsWith("-----"));
+  const everything = readFileSync(AUDIT_FILE, "utf8") + (await call("add_host", { name: "web-9", host: "127.0.0.1", port: sshd2.port, username: "deploy", fingerprint: "SHA256:nope" })).text + (await call("audit", { contains: "add_host", limit: 100 })).text;
+  for (const l of body) assert.ok(!everything.includes(l), "a line of the private key leaked");
+});
+
+test("H5 add_host: the pinned host key is enforced - if another server answers at that address, nothing is run on it", async () => {
+  const file = P("hosts.json"), before = readFileSync(file, "utf8"), hosts = JSON.parse(before);
+  hosts["web-moved"] = { ...hosts["web-2"], port: sshd.port }; // same pin, but behind the address there is now a server with another host key
+  writeFileSync(file, JSON.stringify(hosts, null, 2));
+  try {
+    const marker = P("h5-must-not-exist");
+    for (const [name, args] of [["ssh_exec", { command: `touch ${marker}` }], ["bash", { command: `touch ${marker}` }], ["sftp_list", { path: "/" }]]) {
+      const r = await call(name, { host: "web-moved", ...args });
+      assert.equal(r.isError, true, `${name}: ${r.text}`);
+      assert.match(r.text, /verification failed/i, name);
+    }
+    assert.equal(existsSync(marker), false);
+    assert.match((await call("ssh_exec", { host: "web-2", command: "echo pinned-ok" })).text, /pinned-ok/); // the right server still works
+  } finally { writeFileSync(file, before); }
 });

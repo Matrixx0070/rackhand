@@ -9,9 +9,13 @@ import { exec, spawn } from "node:child_process";
 import { readFileSync, promises as fs } from "node:fs";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { homedir, hostname } from "node:os";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { PassThrough, Transform, type Readable, type Writable } from "node:stream";
+import { createRequire } from "node:module";
+
+// ssh2 is CommonJS and Node cannot see its `utils` as a named export, so it is taken from the module object.
+const sshUtils = (createRequire(import.meta.url)("ssh2") as typeof import("ssh2")).utils;
 
 const PORT = Number(process.env.PORT ?? 8787);
 const SECRET = process.env.MCP_SECRET ?? "";
@@ -19,7 +23,7 @@ const HOSTS_FILE = process.env.HOSTS_FILE ?? "./hosts.json";
 const MAX_OUT = 100_000;
 const JOBS_DIR = process.env.JOBS_DIR ?? "/var/lib/ssh-mcp/jobs"; // ssh_spawn: <jobId>.log / .exit / .pid / .cmd / .sh
 const MAX_PAYLOAD = 64 * 1024; // bytes of command/code sent inline (base64) in one shell argument
-const VERSION = "1.4.0";
+const VERSION = "1.5.0";
 // Sent to the client at initialize; clients put it in front of the model. Keep it short: it costs tokens in every conversation.
 const INSTRUCTIONS = `Remote shell and files on the hosts from list_hosts ("local" = the machine this connector runs on).
 Every tool call is a round trip, so do as much as possible per call:
@@ -29,6 +33,8 @@ Every tool call is a round trip, so do as much as possible per call:
 - bash: join steps with && or newlines instead of separate calls; pass quiet: true when only success or failure matters (the full output stays in a file on the host); use run_in_background plus ssh_job (wait) for anything that takes more than a minute.
 - bridge: large, binary or many files, moved directly from a sandbox shell.
 - audit: the log of every call made through this connector, from any chat or client.
+- add_host: connect another server (it tells you what to do on that server).
+A few catastrophic commands (deleting /, formatting a disk, powering off) are refused unless the call says confirm: true; only pass it when the user really wants that.
 bash starts in the home directory unless cwd or a session is given.`;
 
 if (SECRET.length < 32) throw new Error("Set MCP_SECRET (>=32 random chars)");
@@ -670,6 +676,7 @@ function auditInfo(tool: string, a: Args): AuditInfo {
     case "ssh_job": return { host, what: `${a.action} ${a.jobId}` };
     case "batch": return { host, what: `${((a.ops ?? []) as unknown[]).length} ops` };
     case "bridge": return { what: `ttl_hours=${a.ttl_hours}` };
+    case "add_host": return { what: `${a.name} = ${a.username}@${a.host}:${a.port}` };
     case "audit": return { what: [a.contains !== undefined ? `contains=${JSON.stringify(a.contains)}` : "", a.limit !== 50 ? `limit=${a.limit}` : "", a.since_minutes ? `since_minutes=${a.since_minutes}` : ""].filter(Boolean).join(" ") };
     default: return { host };
   }
@@ -703,9 +710,11 @@ async function auditShow(limit: number, contains: string | undefined, sinceMinut
     if (r.event) return r.event === "start" ? `${secs(r.t)}  server started: v${r.version}, pid ${r.pid}` : `${secs(r.t)}  audit log ${r.event}: ${r.why ?? ""}`.trimEnd();
     const e: Args | undefined = r.end;
     const result = !e ? "no result (still running, or the server stopped)"
-      : Array.isArray(e.exits) && !e.ok ? `exits ${e.exits.join(",")}`
-      : typeof e.exit === "number" && e.exit !== 0 ? `exit ${e.exit}`
-      : e.ok ? "ok" : `FAILED${e.err ? `: ${clip(flat(String(e.err)), 160)}` : ""}`;
+      : e.tripwire ? `REFUSED by the tripwire: ${clip(flat(String(e.tripwire)), 160)}`
+      : (Array.isArray(e.exits) && !e.ok ? `exits ${e.exits.join(",")}`
+        : typeof e.exit === "number" && e.exit !== 0 ? `exit ${e.exit}`
+        : e.ok ? "ok" : `FAILED${e.err ? `: ${clip(flat(String(e.err)), 160)}` : ""}`)
+        + (e.confirmed ? ` (confirmed: ${clip(flat(String(e.confirmed)), 160)})` : "") + (e.ok && typeof e.added === "boolean" ? (e.added ? " (added)" : " (not added yet)") : "");
     const what = [r.bg ? "[background]" : "", r.cwd ? `(in ${r.cwd})` : "", r.what ?? ""].filter(Boolean).join(" ");
     return [secs(r.t), r.ip ?? "-", r.via ?? "-", `${r.tool}${r.batch ? `#${String(r.batch).split("#")[1]}` : ""}`, r.host ?? "-", result,
       e ? `${(Number(e.ms) / 1000).toFixed(2)}s` : "-", clip(flat(what), 300)].join("  ").trimEnd();
@@ -716,6 +725,308 @@ async function auditShow(limit: number, contains: string | undefined, sinceMinut
   const head = `audit log: ${auditFile} - `;
   return lines.length ? `${head}${Math.min(limit, lines.length)} of ${lines.length} matching entries, oldest first\n${lines.slice(-limit).join("\n")}` : `${head}no matching entries`;
 }
+
+// ── v1.5: tripwire ────────────────────────────────────────────────────────────────────────────────────────────
+// A short list of commands that are almost never meant and hard to undo - delete / or a system directory,
+// format or overwrite a disk, power the machine off, a fork bomb - is refused unless the call says confirm: true.
+// It reads the text of the command and never runs anything to find out, so what a variable holds, what a script
+// file does or what is piped into a shell is beyond it, and it is easy to get around on purpose. That is fine:
+// it is there to catch accidents, not to stop anyone. TRIPWIRE=off turns it off.
+const TRIPWIRE_OFF = /^(off|0|false|no)$/i.test(process.env.TRIPWIRE ?? "");
+// A recursive delete, chmod or chown of one of these breaks the machine ...
+const SYSTEM_DIRS = new Set(["/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32", "/proc", "/run", "/sbin", "/sys", "/usr", "/var",
+  "/usr/bin", "/usr/lib", "/usr/lib64", "/usr/sbin", "/var/lib"]);
+// ... and a recursive delete of one of these loses just as much.
+const VITAL_DIRS = new Set([...SYSTEM_DIRS, "~", "$HOME", "${HOME}", "/home", "/mnt", "/opt", "/root", "/srv", "/usr/local", "/usr/share"]);
+const DISK = /^\/dev\/(?:(?:sd|hd|vd|xvd)[a-z]+\d*|nvme\d+n\d+(?:p\d+)?|mmcblk\d+(?:p\d+)?|md\d+|dm-\d+|(?:mapper|disk)\/\S+)$/;
+const SHELL_WORDS = new Set(["then", "do", "else", "elif", "if", "while", "until", "!", "time", "command", "builtin", "exec", "nohup", "setsid"]);
+const WRAPPER_ARG: Record<string, RegExp> = { sudo: /^-[ughpCDRT]$/, doas: /^-[uC]$/, nice: /^-n$/, ionice: /^-[cnp]$/, env: /^-[uCS]$/, stdbuf: /^$/ }; // options that take a value
+const HERE_DOC = /^<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|\\?([^\s;|&<>()'"\\]+))/;
+const baseName = (w: string) => w.slice(w.lastIndexOf("/") + 1);
+const present = <T>(x: T | null | undefined): x is T => x != null;
+
+// The here-document whose text starts after the newline at `nl`: [where the text ends, where its closing line ends], or null if it never closes.
+function hereDoc(s: string, nl: number, end: string, dash: boolean): [number, number] | null {
+  for (let j = nl; j >= 0; ) {
+    const k = s.indexOf("\n", j + 1), line = s.slice(j + 1, k < 0 ? s.length : k);
+    if ((dash ? line.replace(/^\t+/, "") : line) === end) return [j, k < 0 ? s.length : k];
+    j = k;
+  }
+  return null;
+}
+// The simple commands of a shell command line: the words of each, and the here-documents it reads.
+// It follows the shell's nesting - "..." may hold $(...), which holds commands with quotes of their own - because
+// a splitter that loses its place there would later take the text of an `echo "..."` for commands. A command
+// substitution leaves "$()" in the word it stood in, and its own commands are listed like any others.
+type ShellCmd = { words: string[]; here: string[] };
+function shellCommands(s: string): ShellCmd[] {
+  const cmds: ShellCmd[] = [], waiting: { end: string; dash: boolean; of: ShellCmd }[] = [], DEEPEST = 40;
+  let i = 0, arithmetic = true;
+  // `((...))` or `$((...))` with s[at] its first "(": where it ends, or -1 if it is two nested subshells instead
+  const arithmeticEnd = (at: number): number => {
+    if (!arithmetic || s[at + 1] !== "(") return -1;
+    for (let j = at + 2, depth = 2; j < s.length; j++) {
+      if (s[j] === "(") depth++;
+      else if (s[j] === ")" && --depth === 1) return s[j + 1] === ")" ? j + 1 : -1;
+    }
+    arithmetic = false; // it never closes: do not read the rest of the text again for every "(("
+    return -1;
+  };
+  // `$(` or a backtick at i, with room to go deeper: reads the commands inside, leaves i on the closing character
+  const substitution = (nest: number): string => {
+    if (s[i] === "`") { i++; list("`", nest + 1); return "$()"; }
+    const end = arithmeticEnd(i + 1);
+    if (end >= 0) i = end; else { i += 2; list(")", nest + 1); }
+    return "$()";
+  };
+  const starts = (nest: number) => nest < DEEPEST && ((s[i] === "$" && s[i + 1] === "(") || s[i] === "`");
+  // "..." with i on the opening quote: its text, with i left on the closing quote
+  const quoted = (nest: number): string => {
+    let t = "";
+    for (i++; i < s.length && s[i] !== '"'; i++) {
+      if (s[i] === "\\" && i + 1 < s.length) t += s[++i];
+      else if (starts(nest)) t += substitution(nest);
+      else if (s[i] === "$" && s[i + 1] === "{" && nest < DEEPEST) t += param(nest + 1, true);
+      else t += s[i];
+    }
+    return t;
+  };
+  // ${...} with i on the "$": its text as written, with i left on the closing brace. It may hold others: ${CC:+"${CC}"}
+  const param = (nest: number, inQuotes: boolean): string => {
+    const from = i;
+    for (i += 2; i < s.length && s[i] !== "}"; i++) {
+      if (s[i] === "\\") i++;
+      else if (starts(nest)) substitution(nest);
+      else if (s[i] === "$" && s[i + 1] === "{" && nest < DEEPEST) param(nest + 1, inQuotes);
+      else if (s[i] === '"' && nest < DEEPEST) quoted(nest + 1);
+      else if (s[i] === "'" && !inQuotes) { const k = s.indexOf("'", i + 1); i = k < 0 ? s.length : k; }
+    }
+    return s.slice(from, i + 1);
+  };
+  // A list of commands, up to the end of the text or to the character that closes it (left under i).
+  const list = (close: "" | ")" | "`", nest: number): void => {
+    let cur: ShellCmd = { words: [], here: [] }, w = "", open = false;
+    let cases = 0, caseAt = -1, pattern = false, test = false; // inside case ... esac; where its word is; reading a label; inside [[ ]]
+    let first = true;                                          // still in front of the command's own name (only `then`, `do`, ... so far)
+    const word = () => {
+      if (!open) return;
+      const x = w, leads = first; w = ""; open = false;
+      if (x === "esac" && !cur.words.length && cases > 0) { cases--; pattern = false; return; }
+      cur.words.push(x);
+      first = leads && SHELL_WORDS.has(x);
+      if (x === "case" && leads) { cases++; caseAt = cur.words.length - 1; }
+      else if (x === "in" && caseAt >= 0 && cur.words.length === caseAt + 3) { pattern = true; cur.words = []; caseAt = -1; first = true; }
+      else if (x === "[[" && leads) test = true;
+      else if (x === "]]") test = false;
+    };
+    const cmd = () => {
+      word(); caseAt = -1; test = false; first = true;
+      if (pattern) cur.words = [];                                              // a `case` label is not a command
+      else if (cur.words.length) { cmds.push(cur); cur = { words: [], here: [] }; }
+    };
+    for (; i < s.length; i++) {
+      const c = s[i];
+      if (c === "'") { const k = s.indexOf("'", i + 1); w += s.slice(i + 1, k < 0 ? s.length : k); open = true; i = k < 0 ? s.length : k; }
+      else if (c === '"') { w += quoted(nest + 1); open = true; }
+      else if (c === "\\" && i + 1 < s.length) { i++; if (s[i] !== "\n") { w += s[i]; open = true; } }
+      else if (c === "$" && s[i + 1] === "'") { for (i += 2; i < s.length && s[i] !== "'"; i++) w += s[i] === "\\" ? s[++i] ?? "" : s[i]; open = true; } // $'it\'s'
+      else if (c === "$" && s[i + 1] === "{" && nest < DEEPEST) { w += param(nest + 1, false); open = true; }
+      else if (c === "`" && close === "`") { cmd(); return; }
+      else if (starts(nest)) { w += substitution(nest); open = true; }
+      else if (c === "<" && s[i + 1] === "<" && s[i + 2] === "<") { word(); i += 2; }                                          // here-string
+      else if (c === "<" && s[i + 1] === "<" && !test && HERE_DOC.test(s.slice(i, i + 200))) {
+        const m = HERE_DOC.exec(s.slice(i, i + 200))!;
+        word();
+        waiting.push({ end: m[2] ?? m[3] ?? m[4], dash: m[1] === "-", of: cur });
+        i += m[0].length - 1;
+      }
+      else if (c === "#" && !open) { while (i + 1 < s.length && s[i + 1] !== "\n") i++; }
+      else if (c === " " || c === "\t" || c === "\r") word();
+      else if (c === "\n") {
+        cmd();
+        for (const h of waiting.splice(0)) { // the text of a here-document is not commands - unless it is fed to a shell, see tripwire()
+          const r = hereDoc(s, i, h.end, h.dash);
+          h.of.here.push(s.slice(i + 1, r ? r[0] : s.length));
+          i = r ? r[1] : s.length;
+        }
+      }
+      else if (test && "()|&<>".includes(c)) { w += c; open = true; }                                                         // [[ $x =~ ^(a|b)$ ]]
+      else if (c === ";") { cmd(); if (cases > 0 && (s[i + 1] === ";" || s[i + 1] === "&")) { pattern = true; i += s[i + 2] === "&" ? 2 : 1; } }
+      else if (c === "&" || c === "|") cmd();
+      else if (c === "(") {
+        const end = arithmeticEnd(i);
+        if (end >= 0) i = end;                                                                                                   // (( x++ )): no commands in it
+        else if (pattern) continue;                                                                                              // (label)
+        else if (open && /[=!@*?+]$/.test(w) && nest < DEEPEST) { const mark = cmds.length; i++; list(")", nest + 1); cmds.length = mark; w += "()"; } // arr=(a b), !(glob)
+        else if (nest < DEEPEST) { cmd(); i++; list(")", nest + 1); }                                                            // ( subshell ), f()
+        else cmd();
+      }
+      else if (c === ")") {
+        word();                                                                                                                  // first: `esac)` ends the case, and then this closes the list
+        if (pattern) { cur.words = []; pattern = false; }                                                                        // the end of a `case` label
+        else if (close === ")") { cmd(); return; }
+        else cur.words = [];
+      }
+      else if ((c === "{" && !open && /\s/.test(s[i + 1] ?? " ")) || (c === "}" && !open)) cmd();                              // a { group }, not a {brace,expansion}
+      else { w += c; open = true; }
+    }
+    cmd();
+  };
+  list("", 0);
+  return cmds;
+}
+// {a,b} alternatives of a word: /{etc,usr} -> /etc, /usr
+function braces(word: string): string[] {
+  let out = [word];
+  for (let round = 0; round < 6 && word.length <= 200; round++) { // a path that matters is short, and a few levels are plenty
+    const next: string[] = [];
+    for (const x of out) {
+      const m = next.length < 64 ? /^(.*?)\{([^{}]*,[^{}]*)\}(.*)$/s.exec(x) : null;
+      if (m) for (const alt of m[2].split(",")) next.push(m[1] + alt + m[3]); else next.push(x);
+    }
+    if (next.length === out.length) break;
+    out = next;
+  }
+  return out;
+}
+// Peel off what stands in front of the real command: VAR=value, shell keywords, sudo, timeout, env, nice ...
+function realCommand(words: string[]): string[] {
+  const w = words.slice();
+  for (let n = 0; n < 12 && w.length; n++) {
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w[0])) { w.shift(); continue; }
+    const name = baseName(w[0]);
+    if (SHELL_WORDS.has(name)) { w.shift(); continue; }
+    if (name === "timeout" || name in WRAPPER_ARG) {
+      const takesValue = name === "timeout" ? /^-[ks]$/ : WRAPPER_ARG[name];
+      w.shift();
+      while (w.length && w[0].startsWith("-")) { if (takesValue.test(w.shift()!)) w.shift(); }
+      if (name === "timeout") w.shift(); // the duration
+      continue;
+    }
+    break;
+  }
+  return w;
+}
+// Why a command is on the short list, or null. Looks into `bash -c '...'`, `ssh host '...'`, `eval ...` and
+// scripts fed to a shell as a here-document, a few levels deep.
+function tripwire(command: string, depth = 0): string | null {
+  if (command.length > 1_000_000) command = command.slice(0, 1_000_000); // far more than a shell accepts as one command
+  if (/:\s{0,4}\(\s{0,4}\)\s{0,4}\{[^}]{0,40}:\s{0,4}\|\s{0,4}:[^}]{0,40}\}\s{0,4};\s{0,4}:/.test(command)) return "a fork bomb"; // bounded on purpose: this runs on every command
+  const dirIn = (set: Set<string>) => (p: string) => { const t = p.replace(/\/{2,}/g, "/").replace(/\/\*$/, "").replace(/(.)\/+$/, "$1") || "/"; return set.has(t) ? t : null; };
+  for (const { words, here } of shellCommands(command)) {
+    for (let i = 0; i < words.length; i++) { // a redirect that lands on a disk, whatever the command is
+      const m = /^\d*>>?(.*)$/.exec(words[i]), target = m ? m[1] || words[i + 1] || "" : "";
+      if (DISK.test(target)) return `a redirect writes over the disk ${target}`;
+    }
+    const w = realCommand(words);
+    const name = w.length ? baseName(w[0]) : /^(sudo|doas)$/.test(baseName(words[0])) ? "sh" : ""; // `sudo -i` is a shell
+    if (!name) continue;
+    const args = w.slice(1), flags: string[] = [], rest: string[] = [];
+    let plain = false;
+    for (const a of args) { if (!plain && a === "--") plain = true; else if (!plain && a.length > 1 && a.startsWith("-")) flags.push(a); else rest.push(a); }
+    const recursive = (letters: string) => flags.some((f) => f === "--recursive" || (/^-[A-Za-z]+$/.test(f) && [...letters].some((l) => f.includes(l))));
+    const targets = rest.flatMap((a) => braces(a)), disk = rest.find((a) => DISK.test(a));
+    const vital = targets.map(dirIn(VITAL_DIRS)).find(present), system = targets.map(dirIn(SYSTEM_DIRS)).find(present);
+    if (name === "rm" && vital && recursive("rR")) return `recursive delete of ${JSON.stringify(vital)}`;
+    if (/^ch(mod|own|grp)$/.test(name) && system && recursive("R")) return `recursive ${name} of ${JSON.stringify(system)}`;
+    if (name === "find") { // only when nothing narrows down what is deleted
+      const a = args.slice();
+      while (/^-[HLP]$/.test(a[0] ?? "")) a.shift();
+      const at = a.findIndex((x) => /^[-(!]/.test(x)), expr = at < 0 ? [] : a.slice(at), root = a.slice(0, at < 0 ? a.length : at).flatMap((x) => braces(x)).map(dirIn(VITAL_DIRS)).find(present);
+      const deletes = expr.includes("-delete") || expr.some((x, i) => /^-(exec|execdir|ok|okdir)$/.test(x) && baseName(expr[i + 1] ?? "") === "rm");
+      const narrowed = expr.some((x) => /^-(i?name|i?path|i?wholename|i?regex|i?lname|user|group|uid|gid|[mca]time|[mca]min|newer\w*|size|inum|samefile|empty|perm|links|used)$/.test(x));
+      if (root && deletes && !narrowed) return `find deletes everything under ${JSON.stringify(root)}`;
+    }
+    const device = rest.find((a) => a.startsWith("/dev/") || a.includes("$")); // a file image is fine; a device, or a variable that may be one, is not
+    if (/^(mkfs(\..+)?|mke2fs|mkdosfs|mkntfs)$/.test(name) && device) return `${name} formats ${device}`;
+    if ((name === "blkdiscard" || (name === "wipefs" && flags.some((f) => f === "--all" || /^-[A-Za-z]*a/.test(f)))) && device) return `${name} wipes ${device}`;
+    if (name === "dd") { const of = args.map((a) => /^of=(.*)$/.exec(a)?.[1]).find((t) => t !== undefined && DISK.test(t)); if (of) return `dd writes over the disk ${of}`; }
+    if (/^(shred|mkswap|tee)$/.test(name) && disk) return `${name} writes over the disk ${disk}`;
+    if (/^(shutdown|poweroff|halt|reboot)$/.test(name) && !(name === "shutdown" && flags.includes("-c"))) return `${name} stops or restarts the machine`;
+    if (/^(init|telinit)$/.test(name) && /^[06]$/.test(rest[0] ?? "")) return `${name} ${rest[0]} stops or restarts the machine`;
+    if (name === "systemctl" && /^(poweroff|halt|reboot|kexec|soft-reboot|suspend|hibernate|hybrid-sleep)$/.test(rest[0] ?? "")) return `systemctl ${rest[0]} stops or restarts the machine`;
+    if (depth < 3) { // a command handed to another shell: as a string, or as a script on its stdin
+      const inner: string[] = [], shell = /^(ba|da|z|k)?sh$/.test(name);
+      if (shell) { const i = args.findIndex((a) => /^-[A-Za-z]*c$/.test(a)); if (i >= 0) inner.push(args[i + 1] ?? ""); }
+      else if (name === "su") { const i = args.findIndex((a) => a === "-c" || a === "--command"); if (i >= 0) inner.push(args[i + 1] ?? ""); }
+      else if (name === "eval") inner.push(args.join(" "));
+      else if (name === "ssh") { let i = 0; while (i < args.length && args[i].startsWith("-")) i += /^-[bcDEeFIiJLlmOopQRSWw]$/.test(args[i]) ? 2 : 1; inner.push(args.slice(i + 1).join(" ")); }
+      if (shell || name === "su" || name === "ssh") inner.push(...here);
+      for (const text of inner) { const why = text ? tripwire(text, depth + 1) : null; if (why) return why; }
+    }
+  }
+  return null;
+}
+// Throws when a command is on the list and the call did not confirm it. Either way the audit log says so.
+function tripCheck(commands: { label?: string; command: string }[], confirm: boolean | undefined, how = "confirm: true"): void {
+  if (TRIPWIRE_OFF) return;
+  const reason = commands.map((c) => ({ label: c.label, why: tripwire(c.command) })).filter((h) => h.why !== null).map((h) => `${h.label ? `[${h.label}] ` : ""}${h.why}`).join("; ");
+  if (!reason) return;
+  if (confirm) return void auditNote({ confirmed: reason });
+  auditNote({ tripwire: reason });
+  throw new Error(`Refused by the tripwire: ${reason}. Nothing was run. This is on the short list of commands that are rarely meant and hard to undo; if the user really wants it, send it again with ${how}.`);
+}
+const CONFIRM = "Set true to run a command that the server refused as catastrophic (it says so when it does). Only when the user really wants it";
+
+// ── v1.5: add_host ────────────────────────────────────────────────────────────────────────────────────────────
+// The connector has an SSH key of its own (created on first use, kept next to the other state). add_host logs
+// in to a new server with it, pins the host key that server presented, and saves the entry in hosts.json.
+// There is no password path on purpose: the one manual step is adding the public key on the new server.
+let serialQueue: Promise<unknown> = Promise.resolve();
+const serial = <T>(fn: () => Promise<T>): Promise<T> => { const p = serialQueue.then(fn, fn); serialQueue = p.catch(() => {}); return p; }; // one at a time
+async function connectorKey(): Promise<{ path: string; privateKey: Buffer; publicKey: string }> {
+  let last: unknown;
+  for (const dir of [join(dirname(JOBS_DIR), "keys"), join(homedir(), ".ssh-mcp", "keys")]) {
+    try {
+      const path = join(dir, "id_ed25519");
+      await mkdirp(dir);
+      await fs.chmod(dir, 0o700);
+      if (!(await fs.stat(path).catch(() => null))) {
+        const pair = sshUtils.generateKeyPairSync("ed25519", { comment: `ssh-mcp@${hostname()}` });
+        const created = await fs.writeFile(path, pair.private, { mode: 0o600, flag: "wx" }).then(() => true, (e: NodeJS.ErrnoException) => { if (e.code !== "EEXIST") throw e; return false; });
+        if (created) await fs.writeFile(`${path}.pub`, `${pair.public}\n`, { mode: 0o644 }); // otherwise another process made the key a moment ago: use that one
+      }
+      const privateKey = await fs.readFile(path);
+      let publicKey = (await fs.readFile(`${path}.pub`, "utf8").catch(() => "")).trim();
+      if (!publicKey) { // the .pub file is gone: work it out from the private key
+        const parsed = sshUtils.parseKey(privateKey), k = Array.isArray(parsed) ? parsed[0] : parsed;
+        if (k instanceof Error) throw k;
+        publicKey = `${k.type} ${k.getPublicSSH().toString("base64")} ssh-mcp@${hostname()}`;
+      }
+      return { path, privateKey, publicKey };
+    } catch (e) { last = e; }
+  }
+  throw new Error(`cannot create or read the connector's SSH key: ${(last as Error).message}`);
+}
+type Probe = { fp?: string; keyType?: string; ok: boolean; authFailed?: boolean; who?: string; err?: string };
+// Connect once: note the host key the server presents, try to log in with the connector's key, and if that works run a test command.
+// With `expect`, a server that presents any other host key is dropped before the login is even tried.
+function probeHost(host: string, port: number, username: string, privateKey: Buffer, expect?: string): Promise<Probe> {
+  return new Promise((done) => {
+    const c = new Client();
+    let fp: string | undefined, keyType: string | undefined, settled = false;
+    const finish = (r: Probe) => { if (settled) return; settled = true; clearTimeout(timer); c.end(); done({ fp, keyType, ...r }); };
+    const timer = setTimeout(() => finish({ ok: false, err: "timed out after 25 s" }), 25_000);
+    c.on("ready", () => c.exec("whoami; uname -n", (err, stream) => {
+      if (err) return finish({ ok: true, who: username });
+      let out = "";
+      stream.on("data", (d: Buffer) => (out += d));
+      stream.stderr.on("data", () => {});
+      stream.on("close", () => finish({ ok: true, who: out.trim().split(/\s+/).slice(0, 2).join(" on ") || username }));
+    }));
+    c.on("error", (e: Error & { level?: string }) => finish({ ok: false, authFailed: e.level === "client-authentication", err: e.message }));
+    c.connect({
+      host, port, username, privateKey, readyTimeout: 15_000,
+      hostVerifier: (key: Buffer) => { // remember what was presented, so the caller can show it
+        fp = `SHA256:${createHash("sha256").update(key).digest("base64").replace(/=+$/, "")}`;
+        const n = key.length >= 4 ? key.readUInt32BE(0) : 0;
+        keyType = n > 0 && n < 64 && key.length >= 4 + n ? key.subarray(4, 4 + n).toString("latin1") : "unknown";
+        return !expect || fp === expect;
+      },
+    });
+  });
+}
+const hostKeyFileOf = (type = "") => (type.startsWith("ecdsa") ? "ssh_host_ecdsa_key.pub" : /rsa/.test(type) ? "ssh_host_rsa_key.pub" : "ssh_host_ed25519_key.pub");
 
 function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: "?" }): McpServer {
   const server = new McpServer({ name: "ssh-connector", version: VERSION }, { instructions: INSTRUCTIONS });
@@ -738,9 +1049,11 @@ function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: 
       host: z.string().describe("Host name from list_hosts"),
       command: z.string().describe("Shell command to run"),
       timeout_sec: z.number().int().min(1).max(1800).default(120),
+      confirm: z.boolean().optional().describe(CONFIRM),
     },
-  }, async ({ host, command, timeout_sec }) => {
+  }, async ({ host, command, timeout_sec, confirm }) => {
     try {
+      tripCheck([{ command }], confirm);
       const r = await runCommand(host, command, timeout_sec);
       auditNote({ exit: r.code });
       return text(`exit: ${r.code}\n--- stdout ---\n${trunc(r.stdout)}\n--- stderr ---\n${trunc(r.stderr)}`);
@@ -793,10 +1106,12 @@ function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: 
         command: z.string().describe("Shell command to run"),
         timeout_sec: z.number().int().min(1).max(1800).default(120),
       })).min(1).max(10).describe("1-10 commands, run in parallel"),
+      confirm: z.boolean().optional().describe(CONFIRM),
     },
-  }, async ({ host, commands }) => {
+  }, async ({ host, commands, confirm }) => {
     try {
       getHost(host);
+      tripCheck(commands.map((c) => ({ label: c.id, command: c.command })), confirm);
       const dup = commands.find((c, i) => commands.findIndex((o) => o.id === c.id) !== i);
       if (dup) throw new Error(`Duplicate id "${dup.id}"`);
       const max = Math.floor(MAX_OUT / commands.length); // the MAX_OUT budget is shared across blocks
@@ -820,10 +1135,12 @@ function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: 
     inputSchema: {
       host: z.string().describe("Host name from list_hosts"),
       command: z.string().min(1).describe("Shell command (bash) to run in the background"),
+      confirm: z.boolean().optional().describe(CONFIRM),
     },
-  }, async ({ host, command }) => {
+  }, async ({ host, command, confirm }) => {
     try {
       checkPayload("command", command);
+      tripCheck([{ command }], confirm);
       const id = newJobId();
       const r = await runScript(host, spawnScript(id, command), 60);
       if (r.code !== 0) throw new Error(`spawn failed (exit ${r.code}): ${(r.stderr || r.stdout).trim()}`);
@@ -872,10 +1189,12 @@ function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: 
       language: z.enum(["python", "node", "bash"]),
       code: z.string().min(1).describe("Source code to run"),
       timeout_sec: z.number().int().min(1).max(1800).default(120),
+      confirm: z.boolean().optional().describe(CONFIRM),
     },
-  }, async ({ host, language, code, timeout_sec }) => {
+  }, async ({ host, language, code, timeout_sec, confirm }) => {
     try {
       checkPayload("code", code);
+      if (language === "bash") tripCheck([{ command: code }], confirm); // the tripwire reads shell only
       const t0 = Date.now();
       const r = await runScript(host, codeScript(language, code, timeout_sec), timeout_sec + 15);
       auditNote({ exit: r.code });
@@ -894,12 +1213,14 @@ function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: 
     session: z.string().regex(/^[A-Za-z0-9_.-]{1,64}$/).optional().describe("Any name; calls that share it share a working directory that `cd` changes. Use one per conversation"),
     run_in_background: z.boolean().default(false).describe("Start it as a background job and return a jobId at once"),
     quiet: z.boolean().default(false).describe("Return only the end of the output (last ~2 KB, ~8 KB after a failure); the full output is kept in a file on the host. Use it when only success or failure matters"),
+    confirm: z.boolean().optional().describe(CONFIRM),
     description: z.string().optional().describe("What the command does (for the transcript; not used by the server)"),
   };
   // ok = the command ran and exited 0. budget = most bytes of output to return. inBatch: see bashScript's noteMove.
-  const runBash = async ({ host, command, timeout, cwd, session, run_in_background, quiet }: z.infer<z.ZodObject<typeof bashShape>>, budget = OUT_HEAD + OUT_TAIL, inBatch = false): Promise<{ out: ToolOut; ok: boolean }> => {
+  const runBash = async ({ host, command, timeout, cwd, session, run_in_background, quiet, confirm }: z.infer<z.ZodObject<typeof bashShape>>, budget = OUT_HEAD + OUT_TAIL, inBatch = false): Promise<{ out: ToolOut; ok: boolean }> => {
     try {
       checkPayload("command", command);
+      tripCheck([{ command }], confirm);
       if (run_in_background) {
         const id = newJobId();
         const cdExpr = cwd ? `printf %s ${shq(cwd)}` : session ? `cat "$(dirname "$D")/sessions/${session}.cwd" 2>/dev/null || printf %s ~` : "printf %s ~";
@@ -1211,6 +1532,64 @@ function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: 
     } catch (e) { return fail(e); }
   });
 
+  // ── v1.5 ──
+  tool("add_host", {
+    description: "Connect another server to this connector, without editing hosts.json by hand. The connector has an SSH key of its own (created on first use). " +
+      "If the server does not accept that key yet, the tool returns the public key line to add to the server's ~/.ssh/authorized_keys: have the user do that, then call it again. " +
+      "When the login works it runs a test command, pins the server's host key and saves the host, which can be used as `host` at once. There is no password option.",
+    inputSchema: {
+      name: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/).describe("Short name to use as `host` in the other tools, e.g. web-1"),
+      host: z.string().regex(/^[A-Za-z0-9:][A-Za-z0-9.:-]{0,252}$/).describe("IP address or DNS name of the server"),
+      username: z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/).describe("User to log in as, e.g. root or ubuntu"),
+      port: z.number().int().min(1).max(65535).default(22),
+      fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9+/]{43}=?$/).optional().describe("Expected host key fingerprint (SHA256:...); if given, the server must present exactly this key"),
+      replace: z.boolean().optional().describe("Overwrite an existing host of the same name"),
+    },
+  }, async ({ name, host, username, port, fingerprint, replace }) => {
+    try {
+      const target = `${username}@${host}:${port}`;
+      const taken = (all: Record<string, HostCfg>) => {
+        if (all[name]?.local) throw new Error(`"${name}" is this machine itself and cannot be replaced.`);
+        if (name in all && !replace) throw new Error(`A host named "${name}" already exists (${all[name].username}@${all[name].host}:${all[name].port ?? 22}). Pass replace: true to overwrite it, or use another name.`);
+      };
+      taken(loadHosts());
+      auditNote({ added: false });
+      const key = await serial(connectorKey);
+      const expect = fingerprint?.replace(/=+$/, "");
+      const p = await probeHost(host, port, username, key.privateKey, expect);
+      if (!p.fp) throw new Error(`Cannot reach ${host}:${port} over SSH: ${p.err ?? "no answer"}`);
+      if (expect && expect !== p.fp) throw new Error(`The host key of ${host}:${port} does not match: expected ${fingerprint}, but the server presented ${p.fp} (${p.keyType}). Nothing was added.`);
+      if (!p.ok && !p.authFailed) throw new Error(`${host}:${port} answered, but the login as ${username} did not complete: ${p.err}`);
+      if (!p.ok) return text([
+        `Not added yet: ${host}:${port} answered, but it does not accept this connector's key for the user ${username}.`,
+        "",
+        `1. On that server, as ${username}, add this line to ~/.ssh/authorized_keys:`,
+        `     ${key.publicKey}`,
+        "   For example by running this there:",
+        `     mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '${key.publicKey}' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys`,
+        `2. Make sure it is the right server: the host key it presented has the fingerprint ${p.fp}`,
+        `   (on that server: ssh-keygen -lf /etc/ssh/${hostKeyFileOf(p.keyType)})`,
+        `3. Call add_host again with the same arguments plus fingerprint: "${p.fp}", so that exactly this server is added.`,
+      ].join("\n"));
+      await serial(async () => {
+        const before = await fs.readFile(HOSTS_FILE, "utf8"), all = JSON.parse(before) as Record<string, HostCfg>;
+        taken(all);
+        all[name] = { host, port, username, privateKeyPath: key.path, hostFingerprint: p.fp };
+        await fs.writeFile(`${HOSTS_FILE}.bak`, before, { mode: 0o600 });
+        await fs.writeFile(`${HOSTS_FILE}.new`, `${JSON.stringify(all, null, 2)}\n`, { mode: 0o600 });
+        await fs.chmod(`${HOSTS_FILE}.new`, 0o600);
+        await fs.rename(`${HOSTS_FILE}.new`, HOSTS_FILE); // all or nothing
+      });
+      auditNote({ added: true, fp: p.fp });
+      return text([
+        `Added host "${name}": ${target}`,
+        `Host key pinned: ${p.fp} (${p.keyType})`,
+        `Test: logged in as ${p.who}`,
+        `Use host: "${name}" in any tool. Saved in ${resolvePath(HOSTS_FILE)} (the previous version is kept as ${resolvePath(HOSTS_FILE)}.bak).`,
+      ].join("\n"));
+    } catch (e) { return fail(e); }
+  });
+
   return server;
 }
 
@@ -1353,7 +1732,7 @@ bridge.put("/tar/:host", guarded(async (req, res) => {
   }, same);
 }));
 
-// POST /exec/<host>[?timeout=<sec>&c64=<cwd>]  body = command  ->  merged output of any size, streamed;
+// POST /exec/<host>[?timeout=<sec>&c64=<cwd>&confirm=1]  body = command  ->  merged output of any size, streamed;
 // the command's exit code is in the X-Exit-Code header.
 bridge.post("/exec/:host", express.text({ type: () => true, limit: "1mb" }), guarded(async (req, res) => {
   const host = hostOf(req, res); if (!host) return;
@@ -1363,6 +1742,8 @@ bridge.post("/exec/:host", express.text({ type: () => true, limit: "1mb" }), gua
   const t = Math.min(1800, Math.max(1, Math.floor(Number(qstr(req.query.timeout) ?? 120)) || 120));
   const cwd = qval(req, "c64", "cwd");
   await audited(whoOf(req), "bridge.exec", { host, what: command, ...(cwd ? { cwd } : {}) }, async (): Promise<AuditEnd> => {
+    try { tripCheck([{ command }], /^(1|true|yes)$/i.test(qstr(req.query.confirm) ?? ""), "?confirm=1 (box exec -y)"); }
+    catch (e) { plain(res, 409, (e as Error).message); return { ok: false, err: (e as Error).message }; }
     // The script answers with one header line, "rc=<exit code> size=<bytes>", then the output itself.
     let head: Buffer | null = Buffer.alloc(0), started = false, rc: number | null = null;
     const body = new Transform({

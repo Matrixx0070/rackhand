@@ -16,7 +16,7 @@ ssh-mcp on your VPS ──SSH/SFTP──▶ any host in hosts.json
 > On AWS EC2, anyone with the URL can also use the instance's IAM role - check what that role allows
 > before you install (see [Security](#security)).
 
-17 tools, one install command, no account, no database. Version 1.4.0.
+18 tools, one install command, no account, no database. Version 1.5.0.
 
 ## Quick start
 
@@ -108,7 +108,7 @@ Same parameter names as the Bash / Read / Write / Edit tools many coding agents 
 
 | Tool | Input | What it does |
 |---|---|---|
-| `bash` | `command`, `timeout` (ms, 120000, max 1800000), `cwd`, `session`, `run_in_background`, `quiet` | Runs a command. stdout+stderr merged in order; a failure adds `[exit code: N]`, a timeout `[timed out after Ns - exit code: 124]`. Starts in the home directory unless `cwd` is given. Calls sharing a `session` name share a working directory that `cd` changes. Output over ~100 KB is cut in the middle and kept in full in a file on the host. `quiet` returns only the end of the output (last ~2 KB, ~8 KB after a failure). `run_in_background` returns a `jobId` (follow with `ssh_job`). |
+| `bash` | `command`, `timeout` (ms, 120000, max 1800000), `cwd`, `session`, `run_in_background`, `quiet`, `confirm` | Runs a command. stdout+stderr merged in order; a failure adds `[exit code: N]`, a timeout `[timed out after Ns - exit code: 124]`. Starts in the home directory unless `cwd` is given. Calls sharing a `session` name share a working directory that `cd` changes. Output over ~100 KB is cut in the middle and kept in full in a file on the host. `quiet` returns only the end of the output (last ~2 KB, ~8 KB after a failure). `run_in_background` returns a `jobId` (follow with `ssh_job`). |
 | `read` | `file_path`, `offset`, `limit` (2000) - or `files[]` (max 20) | Text as numbered lines (`cat -n` style); lines over 2000 chars are cut. Images (png, jpg, gif, webp, up to 4 MB) come back as images. One bad file does not fail the rest. |
 | `write` | `file_path` + `content` - or `files[]` of `{file_path, content, mode}` (max 50) | Creates or overwrites files, in parallel, over one connection. Parent directories are created. |
 | `edit` | `file_path`, `old_string`, `new_string`, `replace_all` - or `edits[]` (max 50) | Exact text replacement; `old_string` must be unique unless `replace_all`. Edits to one file apply in order and the file is written only if all of them succeed. |
@@ -117,13 +117,14 @@ Same parameter names as the Bash / Read / Write / Edit tools many coding agents 
 
 | Tool | Input | What it does |
 |---|---|---|
-| `ssh_exec` | `command`, `timeout_sec` (120, max 1800) | Runs a command; returns `exit`, stdout and stderr separately. |
-| `ssh_exec_many` | `commands[]` of `{id, command, timeout_sec}` (max 10) | Runs them concurrently; one block per id with exit code, stdout, stderr, duration. |
-| `ssh_spawn` | `command` | Starts the command in the background and returns a `jobId` at once. |
+| `ssh_exec` | `command`, `timeout_sec` (120, max 1800), `confirm` | Runs a command; returns `exit`, stdout and stderr separately. |
+| `ssh_exec_many` | `commands[]` of `{id, command, timeout_sec}` (max 10), `confirm` | Runs them concurrently; one block per id with exit code, stdout, stderr, duration. |
+| `ssh_spawn` | `command`, `confirm` | Starts the command in the background and returns a `jobId` at once. |
 | `ssh_job` | `jobId`, `action`: `status` \| `tail` \| `wait` \| `kill` | Job state, end of the log, block until exit, or stop it. |
 | `ssh_jobs` | `limit` (50) | Lists jobs newest first: `running`, `exited` (with code) or `lost`. |
-| `exec_code` | `language`: `python` \| `node` \| `bash`, `code`, `timeout_sec` | Writes the code to a temp file, runs it, returns exit, stdout, stderr. |
+| `exec_code` | `language`: `python` \| `node` \| `bash`, `code`, `timeout_sec`, `confirm` | Writes the code to a temp file, runs it, returns exit, stdout, stderr. |
 | `list_hosts` | - | Lists the hosts in `hosts.json`. |
+| `add_host` | `name`, `host`, `username`, `port` (22), `fingerprint`, `replace` | Connects another server: tests the login, pins its host key, saves it ([More hosts](#more-hosts)). |
 | `sftp_read` / `sftp_write` / `sftp_list` | `path`, ... | Plain file read (utf8/base64), write and directory listing. |
 | `bridge` | `ttl_hours` (12, max 168) | Returns a time-limited URL and a one-line installer for the `box` command (below). |
 | `audit` | `limit` (50), `contains`, `since_minutes` | Shows the audit log (below): what was run on the hosts, from any chat or client. |
@@ -132,13 +133,61 @@ Which one to use: `batch` for anything with more than one step; `bash` / `read` 
 `ssh_exec_many` for several independent commands; `run_in_background` + `ssh_job` for anything long; the bridge for
 big, binary or many files.
 
+### The tripwire
+
+A model can make the kind of mistake that has no undo. So a short list of commands is refused unless the call says
+`confirm: true` (`box exec -y` on the bridge):
+
+| Refused without `confirm` | Examples |
+|---|---|
+| Recursive delete of `/`, the home directory or a top-level system directory | `rm -rf /`, `rm -rf / tmp/x` (the stray space), `rm -rf ~`, `rm -rf /etc`, `rm -rf /usr/*`, `find / -delete` |
+| Recursive `chmod` / `chown` of `/` or a system directory | `chmod -R 777 /`, `chown -R app /etc` |
+| Formatting or overwriting a disk | `mkfs.ext4 /dev/sdb1`, `wipefs -a /dev/sda`, `dd of=/dev/sda`, `> /dev/nvme0n1` |
+| Powering off or restarting the machine | `shutdown`, `reboot`, `poweroff`, `halt`, `init 0`, `systemctl reboot` |
+| A fork bomb | `:(){ :\|:& };:` |
+
+```
+Error: Refused by the tripwire: recursive delete of "/etc". Nothing was run. This is on the short list of commands
+that are rarely meant and hard to undo; if the user really wants it, send it again with confirm: true.
+```
+
+Everything else runs without a question: `rm -rf /opt/app/releases/old`, `rm -rf /var/lib/apt/lists/*`,
+`find /var/log -name '*.gz' -delete`, `mkfs.ext4 disk.img`, `dd if=/dev/sda of=backup.img` and `echo "rm -rf /"` are
+none of its business. It looks inside `sudo`, `bash -c '...'`, `ssh host '...'`, `$(...)` and scripts fed to a shell as
+a here-document, on every host and through every tool that runs a command.
+
+**It is a seat belt, not a lock.** It reads the command text and never runs anything to find out, so it is easy to get
+around on purpose (`echo reboot | bash`, a script file, a variable that expands to `/`). It does not make the
+connector safe to hand to someone you do not trust, and it is not a substitute for backups. Refusals and confirmed
+commands are in the [audit log](#audit-log) (`tripwire` / `confirmed`). `TRIPWIRE=off` in `/etc/ssh-mcp.env` turns it off.
+
 ## More hosts
 
-`/opt/ssh-mcp/hosts.json` (see [`hosts.example.json`](hosts.example.json)) lists what the server may reach. It is read
-on every call, so no restart is needed.
+Ask the assistant: *"add my server 203.0.113.10 as web-1, user deploy"*. That is the `add_host` tool:
+
+1. The first call creates the connector's own SSH key (once, in `/var/lib/ssh-mcp/keys`), tries to log in, and when
+   the server does not know the key yet, answers with the one line to add to `~/.ssh/authorized_keys` on that
+   server, and with the fingerprint of the host key the server presented.
+2. You add the line on the server (that is the only manual step) and check the fingerprint there:
+   `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
+3. The second call logs in, runs a test command, **pins the host key** and saves the host. It works at once as
+   `host: "web-1"` in every tool.
+
+```
+Added host "web-1": deploy@203.0.113.10:22
+Host key pinned: SHA256:... (ssh-ed25519)
+Test: logged in as deploy on web-1
+```
+
+A pinned host is only ever talked to if it presents that same key. `add_host` has no password option on purpose:
+a password would have to pass through the model and the chat. It never overwrites an existing name unless told
+`replace: true`, and keeps the previous file as `hosts.json.bak`.
+
+By hand it is the same thing: `/opt/ssh-mcp/hosts.json` (see [`hosts.example.json`](hosts.example.json)) lists what the
+server may reach. It is read on every call, so no restart is needed.
 
 ```bash
-ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519               # the connector's key (once)
+ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519               # a key (once)
 ssh-copy-id -i /root/.ssh/id_ed25519.pub deploy@203.0.113.10        # per target host
 ssh-keyscan -t ed25519 203.0.113.10 2>/dev/null | ssh-keygen -lf -  # -> SHA256:... for hostFingerprint
 ```
@@ -161,12 +210,12 @@ For an assistant that has its own sandbox shell: `bridge` returns `https://<host
 ```bash
 curl -fsS '<url>/cli' -o /tmp/box && bash /tmp/box install
 
-box exec [-t SEC] [-C DIR] [HOST] -- 'command'   # merged output of any size, same exit code; "-" reads a script from stdin
+box exec [-t SEC] [-C DIR] [-y] [HOST] -- 'command'   # merged output of any size, same exit code; "-" reads a script from stdin
 box put  ./file [HOST:]/remote/path [MODE]       # one file, any size, binary-safe, all-or-nothing
 box get  [HOST:]/remote/path [./file|-]
 box push ./dir [HOST:]/remote/dir [-x PATTERN]   # whole tree as one tar.gz stream
 box pull [HOST:]/remote/dir ./dir [-x PATTERN]
-box call TOOL '{json}'                           # any of the 17 tools
+box call TOOL '{json}'                           # any of the 18 tools
 box tools
 ```
 
@@ -225,10 +274,11 @@ the connector does not take down the programs that were started through it.
 
 State on the host: `/var/lib/ssh-mcp/jobs` (background job logs, not pruned), `/var/lib/ssh-mcp/sessions` (one
 remembered working directory per `bash` session), `/var/lib/ssh-mcp/out` (full copies of oversized output, deleted
-after 3 days), `/var/lib/ssh-mcp/audit` (the audit log).
+after 3 days), `/var/lib/ssh-mcp/audit` (the audit log), `/var/lib/ssh-mcp/keys` (the SSH key `add_host` uses).
 
 For a careful upgrade of a busy server there is [`upgrade/deploy.sh`](upgrade/deploy.sh): it swaps in
-`/opt/ssh-mcp/server.new.ts`, checks the tool list, the audit log, a real `batch` call and the bridge, and rolls back by itself.
+`/opt/ssh-mcp/server.new.ts`, checks the tool list, the audit log, the tripwire, a real `batch` call and the bridge, and rolls
+back by itself.
 [`upgrade/rehearse.sh`](upgrade/rehearse.sh) rehearses that on a throwaway copy of the service first.
 
 ## Security
@@ -242,7 +292,8 @@ For a careful upgrade of a busy server there is [`upgrade/deploy.sh`](upgrade/de
   with a shell, so anyone with the URL has that role's permissions. The installer prints a warning when it finds a
   role. Give the instance no role, or one with only the permissions the machine itself needs.
 - An AI model decides which commands to run. Review what it does, keep backups, and do not point it at a machine
-  whose loss you cannot afford.
+  whose loss you cannot afford. The [tripwire](#the-tripwire) catches a few well-known accidents; it is not a
+  permission system.
 - Optional hardening: restrict the proxy to your AI provider's published outbound IP ranges, use your own domain,
   rotate the secret, run the service as a less privileged user.
 
@@ -253,13 +304,13 @@ Found a security problem? Please report it privately (GitHub: Security → Repor
 ```bash
 npm ci
 npm run typecheck
-npm test          # 133 black-box tests over the HTTP endpoint, against "local" and an in-process SSH server
+npm test          # 143 black-box tests over the HTTP endpoint, against "local" and an in-process SSH server
 ```
 
 The whole server is one file, [`server.ts`](server.ts), run with `tsx`; [`box.sh`](box.sh) is the bridge client the
 server hands out. Configuration is by environment variable: `MCP_SECRET` (required, 32+ characters), `PORT` (8787),
 `HOSTS_FILE` (`./hosts.json`), `JOBS_DIR` (`/var/lib/ssh-mcp/jobs`), `PUBLIC_URL` (only if the proxy does not send
-`X-Forwarded-Host`), and the `AUDIT_*` settings above.
+`X-Forwarded-Host`), the `AUDIT_*` settings above and `TRIPWIRE=off`.
 
 ## License
 

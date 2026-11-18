@@ -10,7 +10,7 @@ usage() {
   cat >&2 <<'EOF'
 box - talk to the ssh-mcp connector from a sandbox shell
 
-  box exec [-t SEC] [-C DIR] [HOST] -- COMMAND   run a command: merged output, same exit code
+  box exec [-t SEC] [-C DIR] [-y] [HOST] -- COMMAND   run a command: merged output, same exit code (-y: confirm a command the server refused)
                                                  COMMAND "-" reads a script from stdin
   box put  LOCAL [HOST:]REMOTE [MODE]            upload one file (parent directories are created)
   box get  [HOST:]REMOTE [LOCAL|-]               download one file ("-" writes to stdout)
@@ -36,23 +36,25 @@ http_status() { awk 'toupper($1) ~ /^HTTP\// { s = $2 } END { print s }' "$1"; }
 http_header() { awk -v k="$2:" 'tolower($1) == k { v = $2 } END { gsub(/\r/, "", v); print v }' "$1"; }
 
 cmd_exec() {
-  local t=120 cwd="" host=local
+  local t=120 cwd="" host=local yes=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -t) t="$2"; shift 2 ;;
+      -y|--yes) yes=1; shift ;;
       -C) cwd="$2"; shift 2 ;;
       --) shift; break ;;
       -*) die "exec: unknown option $1" ;;
       *) host="$1"; shift ;;
     esac
   done
-  [ $# -gt 0 ] || die "usage: box exec [-t SEC] [-C DIR] [HOST] -- COMMAND"
+  [ $# -gt 0 ] || die "usage: box exec [-t SEC] [-C DIR] [-y] [HOST] -- COMMAND"
   mktmp
   [[ "$t" =~ ^[0-9]+$ ]] || die "exec: -t takes whole seconds"
   if [ "$*" = "-" ]; then cat > "$T/cmd"; else printf %s "$*" > "$T/cmd"; fi
   [ -s "$T/cmd" ] || die "exec: empty command"
   local q="timeout=$t" code
   [ -n "$cwd" ] && q="$q&c64=$(b64u "$cwd")"
+  [ -n "$yes" ] && q="$q&confirm=1"   # run a command the server's tripwire refused
   # nothing comes back until the command has finished, so allow that much silence (plus a margin), then any size of output
   curl -sS --connect-timeout 20 -y $((t + 60)) -Y 1 -D "$T/h" -o "$T/o" -H 'Content-Type: text/plain' --data-binary @"$T/cmd" "$BOX_URL/exec/$host?$q" || die "request failed"
   if [ "$(http_status "$T/h")" = 200 ]; then
