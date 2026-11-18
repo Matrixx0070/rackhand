@@ -16,7 +16,7 @@ ssh-mcp on your VPS ──SSH/SFTP──▶ any host in hosts.json
 > On AWS EC2, anyone with the URL can also use the instance's IAM role - check what that role allows
 > before you install (see [Security](#security)).
 
-18 tools, one install command, no account, no database. Version 1.6.1.
+18 tools, one install command, no account, no database. Version 1.7.0.
 
 ## Quick start
 
@@ -230,8 +230,13 @@ the server has it:
 - `PQ_SSH=require` in `/etc/ssh-mcp.env` refuses every remote host that is not post-quantum, and `add_host` then
   adds nothing else. `PQ_SSH=off` turns the feature off.
 
-What it costs: one more SSH handshake per call. Measured with client and server on one machine: about 0.2 s with
-OpenSSH 9.6 (sntrup761), nothing measurable with OpenSSH 10.2 (ML-KEM).
+What it costs: making the connection takes two SSH handshakes instead of one (about 0.3 s with OpenSSH 9.6 on one
+machine). It is then **kept and shared**: an unused connection stays open for 60 seconds, and up to four calls run
+on one at the same time, so the calls that follow need no handshake at all. Measured that way, a call to a
+post-quantum host took 48 ms, against 80 ms for a classical host, which connects anew every time. `PQ_SSH_KEEP` in
+`/etc/ssh-mcp.env` sets the seconds; `0` makes a connection per call. A connection that died while it was not
+used is replaced without the call failing, and a server that allows only one session per connection
+(`MaxSessions 1`) gets a connection per overlapping call.
 
 What it does not cover:
 
@@ -348,15 +353,15 @@ Found a security problem? Please report it privately (GitHub: Security → Repor
 ```bash
 npm ci
 npm run typecheck
-npm test          # 154 black-box tests over the HTTP endpoint, against "local", an in-process SSH server and a real sshd
+npm test          # 163 black-box tests over the HTTP endpoint, against "local", an in-process SSH server and a real sshd
 ```
 
 The whole server is one file, [`server.ts`](server.ts), run with `tsx`; [`box.sh`](box.sh) is the bridge client the
 server hands out. Configuration is by environment variable: `MCP_SECRET` (required, 32+ characters), `PORT` (8787),
 `HOSTS_FILE` (`./hosts.json`), `JOBS_DIR` (`/var/lib/ssh-mcp/jobs`), `PUBLIC_URL` (only if the proxy does not send
-`X-Forwarded-Host`), the `AUDIT_*` settings above, `TRIPWIRE=off` and `PQ_SSH` (`off` or `require`).
+`X-Forwarded-Host`), the `AUDIT_*` settings above, `TRIPWIRE=off`, `PQ_SSH` (`off` or `require`) and `PQ_SSH_KEEP`.
 
-The nine post-quantum tests start a private `sshd` on a loopback port and read its log, so they need the OpenSSH
+The fourteen post-quantum tests start a private `sshd` on a loopback port and read its log, so they need the OpenSSH
 server and a client with a post-quantum key exchange (`apt-get install openssh-server openssh-client`); without
 them they are skipped and say so.
 

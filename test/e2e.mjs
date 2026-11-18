@@ -6,13 +6,14 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { appendFileSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, renameSync, existsSync, statSync, lstatSync, chmodSync,
+import { appendFileSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, renameSync, existsSync, statSync, lstatSync, chmodSync, truncateSync,
   openSync, readSync, writeSync, fstatSync, fchmodSync, closeSync } from "node:fs";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { tmpdir, userInfo } from "node:os";
 import net from "node:net";
 import path from "node:path";
 import http from "node:http";
+import { getDefaultHighWaterMark } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 
@@ -36,7 +37,7 @@ const NEW = ["bash", "read", "write", "edit", "bridge"]; // v1.2
 const V13 = ["batch"]; // v1.3
 const V14 = ["audit"]; // v1.4
 const V15 = ["add_host"]; // v1.5
-const VERSION = "1.6.1";
+const VERSION = "1.7.0";
 const ALL_TOOLS = [...OLD, ...NEW, ...V13, ...V14, ...V15];
 const HOSTS = ["local", "remote"];
 const MAX_OUT = 100_000;
@@ -61,6 +62,7 @@ function startSshd({ authorizedFile } = {}) {
   if (!authorizedFile) writeFileSync(path.join(TMP, "client"), client.private, { mode: 0o600 });
   const fp = "SHA256:" + createHash("sha256").update(utils.parseKey(host.private).getPublicSSH()).digest("base64").replace(/=+$/, "");
   const stats = { logins: 0 }; // public-key login attempts this server was offered
+  const tune = { pieces: 0 };  // > 0: a command's output reaches the client in pieces of that many bytes, as it does from a real server when it trickles
   const srv = new Server({ hostKeys: [host.private] }, (c) => {
     const kids = new Set();
     c.on("authentication", (ctx) => {
@@ -81,7 +83,11 @@ function startSshd({ authorizedFile } = {}) {
         kids.add(child);
         stream.pipe(child.stdin);                      // stdin: EOF only when the client ends the channel
         child.stdin.on("error", () => {});
-        child.stdout.on("data", (d) => { if (stream.write(d) === false) { child.stdout.pause(); stream.once("drain", () => child.stdout.resume()); } });
+        child.stdout.on("data", (d) => {
+          let room = true;
+          for (let i = 0, n = tune.pieces || d.length; i < d.length; i += n) room = stream.write(d.subarray(i, i + n));
+          if (room === false) { child.stdout.pause(); stream.once("drain", () => child.stdout.resume()); }
+        });
         child.stderr.on("data", (d) => stream.stderr.write(d));
         child.on("close", (code) => { kids.delete(child); stream.exit(code ?? 255); stream.end(); });
       });
@@ -90,7 +96,7 @@ function startSshd({ authorizedFile } = {}) {
     c.on("close", () => { for (const k of kids) { k.stdin.destroy(); k.stdout.destroy(); k.stderr.destroy(); k.kill("SIGKILL"); } }); // like sshd: the session's pipes close
     c.on("error", () => {});
   });
-  return new Promise((res) => srv.listen(0, "127.0.0.1", () => res({ srv, port: srv.address().port, fp, stats })));
+  return new Promise((res) => srv.listen(0, "127.0.0.1", () => res({ srv, port: srv.address().port, fp, stats, tune })));
 }
 
 // Minimal SFTP subsystem backed by the local filesystem, enough for ssh2's readFile/writeFile/readdir.
@@ -125,7 +131,7 @@ function serveSftp(sftp) {
 function startServer(port, env = {}) {
   const p = spawn(process.execPath, ["--import", "tsx", path.join(ROOT, SERVER_FILE)], {
     cwd: ROOT,
-    env: { ...process.env, PORT: String(port), MCP_SECRET: SECRET, HOSTS_FILE: path.join(TMP, "hosts.json"), JOBS_DIR: JOBS, TMPDIR: CODE_TMP, ...env },
+    env: { ...process.env, PORT: String(port), MCP_SECRET: SECRET, HOSTS_FILE: path.join(TMP, "hosts.json"), JOBS_DIR: JOBS, TMPDIR: CODE_TMP, PQ_SSH_KEEP: "3", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
   servers.push(p);
@@ -761,6 +767,8 @@ const signTok = (exp) => `${exp.toString(36)}.${createHmac("sha256", SECRET).upd
 const now = () => Math.floor(Date.now() / 1000);
 const p64 = (s) => Buffer.from(s).toString("base64url");
 let BR; // base URL carrying a token minted by the bridge tool
+// the same for a test that may run on its own (--test-name-pattern), before the one that sets BR
+const bridgeBase = async () => BR ?? (BR = (await call("bridge", { ttl_hours: 1 })).text.match(/(http:\/\/127\.0\.0\.1:\d+\/b\/[0-9a-z]+\.[0-9a-f]{32})\/cli/)[1]);
 
 test("G1 bridge tool mints a time-limited URL for sandbox shells", async () => {
   const r = await call("bridge", { ttl_hours: 2 });
@@ -962,7 +970,7 @@ test("G10 a client that disconnects mid-download does not leave the transfer run
   mkdirSync(dir);
   execFileSync("truncate", ["-s", "3G", path.join(dir, "sparse.bin")]); // ~10 s of gzip work
   const ac = new AbortController();
-  const r = await fetch(`${BR}/tar/local?p64=${p64(dir)}`, { signal: ac.signal });
+  const r = await fetch(`${await bridgeBase()}/tar/local?p64=${p64(dir)}`, { signal: ac.signal });
   await r.body.getReader().read();
   assert.notEqual(pgrep(`tar -C ${dir}`), "", "tar is running");
   ac.abort();
@@ -971,30 +979,50 @@ test("G10 a client that disconnects mid-download does not leave the transfer run
   assert.equal((await rpc(BASE, "tools/list")).status, 200); // and the server is fine
 });
 
-// One HTTP request over a bare socket that is closed the moment the announced body is complete. That is what curl
+// HTTP requests over a bare socket that is closed the moment the last announced body is complete. That is what curl
 // does; fetch keeps its connections open, so it never shows what a server does when the client leaves at once.
-function rawRequest(url, { method = "GET", body = "" } = {}) {
-  const u = new URL(url);
+// Several requests go out back to back on the one connection, and their answers come back in that order.
+// slow: the client takes a short break after every 2 MB, as a reader on a thin line does.
+// once: the request says "Connection: close", so it is the server that hangs up after its answer.
+function rawRequests(reqs, { slow = false, once = false } = {}) {
+  const urls = reqs.map((r) => new URL(r.url));
   return new Promise((resolve, reject) => {
-    const sock = net.connect(Number(u.port), u.hostname, () =>
-      sock.write(`${method} ${u.pathname}${u.search} HTTP/1.1\r\nHost: ${u.host}\r\nContent-Type: text/plain\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`));
-    let buf = Buffer.alloc(0);
+    const sock = net.connect(Number(urls[0].port), urls[0].hostname, () => sock.write(reqs.map((r, i) => {
+      const body = r.body ?? "";
+      return `${r.method ?? "GET"} ${urls[i].pathname}${urls[i].search} HTTP/1.1\r\nHost: ${urls[i].host}\r\n${once ? "Connection: close\r\n" : ""}Content-Type: text/plain\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
+    }).join("")));
+    const done = [];
+    let parts = [], have = 0, head = null, start = 0, len = NaN, total = 0, rested = 0;
+    const take = () => { // every whole answer that has arrived by now
+      for (;;) {
+        if (head === null) {
+          const buf = Buffer.concat(parts), at = buf.indexOf("\r\n\r\n");
+          parts = [buf];
+          if (at < 0) return;
+          head = buf.subarray(0, at).toString("latin1"); start = at + 4;
+          len = Number((/^content-length: (\d+)$/im.exec(head) ?? [])[1]);
+        }
+        if (Number.isNaN(len) || have - start < len) return;
+        const buf = Buffer.concat(parts);
+        done.push({ status: Number(head.split(" ")[1]), body: buf.subarray(start, start + len) });
+        parts = [buf.subarray(start + len)]; have = parts[0].length; head = null;
+        if (done.length === reqs.length) { sock.destroy(); return resolve(done); }
+        if (!have) return;
+      }
+    };
     sock.on("data", (d) => {
-      buf = Buffer.concat([buf, d]);
-      const at = buf.indexOf("\r\n\r\n");
-      if (at < 0) return;
-      const head = buf.subarray(0, at).toString("latin1"), len = Number((/^content-length: (\d+)$/im.exec(head) ?? [])[1]);
-      if (Number.isNaN(len) || buf.length - (at + 4) < len) return;
-      sock.destroy();
-      resolve({ status: Number(head.split(" ")[1]), body: buf.subarray(at + 4, at + 4 + len) });
+      parts.push(d); have += d.length; total += d.length;
+      take();
+      if (slow && done.length < reqs.length && total - rested >= 2 * 1024 * 1024) { rested = total; sock.pause(); setTimeout(() => sock.resume(), 30); }
     });
     sock.on("error", reject);
-    sock.on("close", () => reject(new Error("the connection closed before the whole response had arrived")));
+    sock.on("close", () => reject(new Error(`the connection closed before the whole response had arrived (answer ${done.length + 1} of ${reqs.length}: ${head === null ? "nothing" : `${Math.max(0, have - start)} of ${len} bytes`})`)));
   });
 }
+const rawRequest = async (url, { method = "GET", body = "", slow = false, once = false } = {}) => (await rawRequests([{ url, method, body }], { slow, once }))[0];
 
 test("G11 a client that closes the connection as soon as it has the whole response - as curl does - is not recorded as a broken transfer", async () => {
-  const br = BR ?? (await call("bridge", { ttl_hours: 1 })).text.match(/(http:\/\/127\.0\.0\.1:\d+\/b\/[0-9a-z]+\.[0-9a-f]{32})\/cli/)[1];
+  const br = await bridgeBase();
   for (const host of HOSTS) {
     const f = P(`g11-${host}.bin`), data = randomBytes(70_000);
     writeFileSync(f, data);
@@ -1013,11 +1041,180 @@ test("G11 a client that closes the connection as soon as it has the whole respon
     assert.deepEqual([down.status, down.body.length, sum(down.body)], [200, bytes.length, sum(bytes)]);
     const out = await rawRequest(`${br}/exec/${host}`, { method: "POST", body: `echo g11-big >/dev/null; cat ${big}` });
     assert.deepEqual([out.status, out.body.length, sum(out.body)], [200, bytes.length, sum(bytes)]);
+    // and when the request asks the server to hang up after the answer
+    const last = await rawRequest(`${br}/fs/${host}?p64=${p64(big)}`, { once: true });
+    assert.deepEqual([last.status, last.body.length, sum(last.body)], [200, bytes.length, sum(bytes)]);
+    const said = await rawRequest(`${br}/exec/${host}`, { method: "POST", body: `echo g11-${host}-once`, once: true });
+    assert.deepEqual([said.status, said.body.toString()], [200, `g11-${host}-once\n`]);
   }
   const pick = (es) => es.filter((e) => (e.tool === "bridge.exec" && /^(echo|:) g11-/.test(e.what ?? "")) || (e.tool === "bridge.get" && /g11-/.test(e.what ?? "")));
-  const mine = await auditWhen(pick, (got) => got.length >= 30 && got.every((e) => e.done));
-  assert.equal(mine.length, 30);
+  const mine = await auditWhen(pick, (got) => got.length >= 34 && got.every((e) => e.done));
+  assert.equal(mine.length, 34);
   assert.deepEqual(mine.filter((e) => !e.ok).map((e) => `${e.tool} ${e.what}: ${e.err}`), [], "each of them got its whole answer");
+});
+
+test("G12 a body that is still on its way through the server when its script has ended arrives whole, however slow the reader", async () => {
+  const br = await bridgeBase();
+  const sum = (b) => createHash("sha256").update(b).digest("hex");
+  let n = 0;
+
+  // The exact case. The reader takes nothing yet: its download is the second request on a connection whose first
+  // answer is still a second away, so the server has to keep the body. It arrives in small pieces, and is of the
+  // length at which the last pieces are still waiting their turn inside the server when the script has ended and
+  // its channel has closed (the response holds one buffer's worth, the stream towards it a second one, and the
+  // next pieces queue up behind those). Cutting the transfer off there would be wrong: nothing is missing.
+  const piece = 1000, held = Math.ceil(getDefaultHighWaterMark(false) / piece);
+  const trickle = P("g12-pieces.bin"), drops = randomBytes(Math.floor(2.5 * held) * piece);
+  writeFileSync(trickle, drops);
+  sshd.tune.pieces = piece;
+  try {
+    for (const host of HOSTS) {
+      const [first, down] = await rawRequests([{ url: `${br}/exec/local`, method: "POST", body: "sleep 1; echo g12-first" }, { url: `${br}/fs/${host}?p64=${p64(trickle)}` }]);
+      assert.deepEqual([first.status, first.body.toString()], [200, "g12-first\n"]);
+      assert.deepEqual([down.status, down.body.length, sum(down.body)], [200, drops.length, sum(drops)], `download in pieces from ${host}`);
+      const [again, out] = await rawRequests([{ url: `${br}/exec/local`, method: "POST", body: "sleep 1; echo g12-first" }, { url: `${br}/exec/${host}`, method: "POST", body: `echo g12-${host} >/dev/null; cat ${trickle}` }]);
+      assert.deepEqual([again.status, out.status, out.body.length, sum(out.body)], [200, 200, drops.length, sum(drops)], `output in pieces from ${host}`);
+      n += 4;
+    }
+  } finally { sshd.tune.pieces = 0; }
+
+  // And the everyday case: more than the kernel holds for a connection, to a reader that keeps the server waiting.
+  const big = P("g12-big.bin"), bytes = randomBytes(24 * 1024 * 1024 + 1000);
+  writeFileSync(big, bytes);
+  for (const host of HOSTS) {
+    const down = await rawRequest(`${br}/fs/${host}?p64=${p64(big)}`, { slow: true });
+    assert.deepEqual([down.status, down.body.length, sum(down.body)], [200, bytes.length, sum(bytes)], `slow download from ${host}`);
+    const out = await rawRequest(`${br}/exec/${host}`, { method: "POST", body: `echo g12-${host} >/dev/null; cat ${big}`, slow: true });
+    assert.deepEqual([out.status, out.body.length, sum(out.body)], [200, bytes.length, sum(bytes)], `slow output from ${host}`);
+    n += 2;
+  }
+  rmSync(big);
+
+  const pick = (es) => es.filter((e) => (e.tool === "bridge.exec" && /g12-/.test(e.what ?? "")) || (e.tool === "bridge.get" && /g12-/.test(e.what ?? "")));
+  const mine = await auditWhen(pick, (got) => got.length >= n && got.every((e) => e.done));
+  assert.equal(mine.length, n);
+  assert.deepEqual(mine.filter((e) => !e.ok).map((e) => `${e.tool} ${e.what}: ${e.err}`), [], "each of them is on record as a whole transfer");
+});
+
+test("G13 a file that becomes shorter while it is being sent ends as a broken transfer, never as a short one that looks whole", async () => {
+  const br = await bridgeBase();
+  // Far more than all the buffers between the file and this reader hold together, so that most of it is still
+  // unread on the host when the reader has the first bytes - and cuts the file in half.
+  const kernel = ["tcp_rmem", "tcp_wmem"].reduce((sum, f) => { try { return sum + Number(readFileSync(`/proc/sys/net/ipv4/${f}`, "utf8").trim().split(/\s+/)[2]); } catch { return sum + 8 * 1024 * 1024; } }, 0);
+  const size = Math.max(64 * 1024 * 1024, 4 * kernel);
+  for (const host of HOSTS) {
+    const f = P(`g13-${host}.bin`);
+    execFileSync("truncate", ["-s", String(size), f]);
+    const u = new URL(`${br}/fs/${host}?p64=${p64(f)}`);
+    const seen = await new Promise((resolve, reject) => {
+      const sock = net.connect(Number(u.port), u.hostname, () => sock.write(`GET ${u.pathname}${u.search} HTTP/1.1\r\nHost: ${u.host}\r\n\r\n`));
+      let first = Buffer.alloc(0), head = null, got = 0;
+      sock.on("data", (d) => {
+        if (head !== null) { got += d.length; return; }
+        first = Buffer.concat([first, d]);
+        const at = first.indexOf("\r\n\r\n");
+        if (at < 0) return;
+        head = first.subarray(0, at).toString("latin1"); got = first.length - (at + 4);
+        sock.pause();
+        truncateSync(f, size / 2);
+        setTimeout(() => sock.resume(), 100);
+      });
+      sock.on("error", () => {}); // the server breaks the connection off: that is the point
+      sock.on("close", () => resolve({ status: Number((head ?? "").split(" ")[1]), announced: Number((/^content-length: (\d+)$/im.exec(head ?? "") ?? [])[1]), got }));
+      setTimeout(() => { sock.destroy(); reject(new Error(`the transfer from ${host} neither finished nor broke off (${got} bytes so far)`)); }, 60_000).unref();
+    });
+    assert.deepEqual([seen.status, seen.announced], [200, size], `what ${host} announced`);
+    assert.ok(seen.got < size, `${host}: the connection was broken off (${seen.got} of ${size} bytes had come)`);
+    rmSync(f);
+  }
+  const mine = await auditWhen((es) => es.filter((e) => e.tool === "bridge.get" && /g13-/.test(e.what ?? "")), (got) => got.length >= HOSTS.length && got.every((e) => e.done));
+  assert.deepEqual(mine.map((e) => [e.ok, e.err]), HOSTS.map(() => [false, "the file became shorter while it was being sent"]));
+  assert.equal((await rpc(BASE, "tools/list")).status, 200); // and the server is fine
+});
+
+test("G14 a client that sent two requests at once and leaves before the second one's turn does not leave that one waiting for a reader that will never come", async () => {
+  const br = await bridgeBase();
+  const file = P("g14-file.bin"), tree = P("g14-tree");
+  execFileSync("truncate", ["-s", "512M", file]);                              // more than fits into any buffer: the script cannot finish by itself
+  mkdirSync(tree);
+  execFileSync("truncate", ["-s", "3G", path.join(tree, "sparse.bin")]);
+  // `running`: the script that feeds the answer. A command run through /exec is another matter: it writes to a file
+  // on the host, not to the reader, and goes on to its end or its timeout whoever is still listening.
+  const cases = [
+    { name: "download from local", second: { url: `${br}/fs/local?p64=${p64(file)}` }, running: `head -c [0-9]+ -- ${file}` },
+    { name: "download from remote", second: { url: `${br}/fs/remote?p64=${p64(file)}` }, running: `head -c [0-9]+ -- ${file}` },
+    { name: "archive from local", second: { url: `${br}/tar/local?p64=${p64(tree)}` }, running: `tar -C ${tree}` },
+    { name: "command on remote", second: { url: `${br}/exec/remote?timeout=600`, method: "POST", body: "echo g14-exec; sleep 41.3" }, command: "sleep 41.3" },
+  ];
+  try {
+    for (const c of cases) {
+      const urls = [new URL(`${br}/exec/local`), new URL(c.second.url)], bodies = ["sleep 19.7; echo g14-first", c.second.body ?? ""], methods = ["POST", c.second.method ?? "GET"];
+      const sock = net.connect(Number(urls[0].port), urls[0].hostname, () => sock.write(urls.map((u, i) =>
+        `${methods[i]} ${u.pathname}${u.search} HTTP/1.1\r\nHost: ${u.host}\r\nContent-Type: text/plain\r\nContent-Length: ${Buffer.byteLength(bodies[i])}\r\n\r\n${bodies[i]}`).join("")));
+      sock.on("error", () => {});
+      const started = c.running ?? c.command;
+      for (let i = 0; i < 80 && !pgrep(started); i++) await sleep(100);
+      assert.notEqual(pgrep(started), "", `${c.name}: it is being worked on, though the answer before it is not out yet`);
+      await sleep(300);
+      sock.destroy();
+      if (!c.running) continue;
+      for (let i = 0; i < 80 && pgrep(c.running); i++) await sleep(100);
+      assert.equal(pgrep(c.running), "", `${c.name}: its script was stopped when the client left`);
+    }
+    // all of them are over and on record as broken off by the client - long before the commands would have ended
+    let mine = [];
+    for (let i = 0; i < 4 && !(mine.length >= 2 * cases.length && mine.every((e) => e.done)); i++)
+      mine = await auditWhen((es) => es.filter((e) => /^bridge\.(get|pull|exec)$/.test(e.tool) && /g14-/.test(e.what ?? "")), (got) => got.length >= 2 * cases.length && got.every((e) => e.done));
+    assert.equal(mine.length, 2 * cases.length);
+    assert.deepEqual(mine.filter((e) => !e.done).map((e) => `${e.tool} ${e.what}`), [], "none of them is still waiting");
+    assert.deepEqual(mine.map((e) => [e.tool, e.what, e.ok, e.err]).filter(([, , ok, err]) => ok !== false || err !== "the client disconnected"), []);
+    assert.equal((await rpc(BASE, "tools/list")).status, 200); // and the server is fine
+  } finally {
+    pkill9("sleep 19.7"); pkill9("sleep 41.3");
+    rmSync(file, { force: true }); rmSync(tree, { recursive: true, force: true });
+  }
+});
+
+test("G15 a body that never reached the client - it left first - is on record as broken off, also when its script had already finished", async () => {
+  const br = await bridgeBase();
+  // Small enough that the script is done long before the reader takes anything, so all of it waits inside the server:
+  // the answer is the second one on its connection, and the first one is still a second away.
+  const piece = 1000, file = P("g15.bin");
+  writeFileSync(file, randomBytes(Math.floor(2.5 * Math.ceil(getDefaultHighWaterMark(false) / piece)) * piece));
+  const tree = P("g15-tree");
+  mkdirSync(tree);
+  writeFileSync(path.join(tree, "a.bin"), randomBytes(300_000));
+  const seconds = [
+    ...HOSTS.flatMap((host) => [
+      { url: `${br}/fs/${host}?p64=${p64(file)}` },
+      { url: `${br}/exec/${host}`, method: "POST", body: `echo g15-${host} >/dev/null; cat ${file}` },
+    ]),
+    { url: `${br}/tar/local?p64=${p64(tree)}` },
+  ];
+  sshd.tune.pieces = piece;
+  try {
+    for (const second of seconds) {
+      const reqs = [{ url: `${br}/exec/local`, method: "POST", body: "sleep 1.1; echo g15-first" }, second];
+      const urls = reqs.map((r) => new URL(r.url));
+      const sock = net.connect(Number(urls[0].port), urls[0].hostname, () => sock.write(reqs.map((r, i) =>
+        `${r.method ?? "GET"} ${urls[i].pathname}${urls[i].search} HTTP/1.1\r\nHost: ${urls[i].host}\r\nContent-Type: text/plain\r\nContent-Length: ${Buffer.byteLength(r.body ?? "")}\r\n\r\n${r.body ?? ""}`).join("")));
+      let got = 0;
+      sock.on("data", (d) => { got += d.length; });
+      sock.on("error", () => {});
+      await sleep(600);
+      assert.equal(got, 0, "nothing has come yet");
+      sock.destroy();
+    }
+  } finally { sshd.tune.pieces = 0; }
+  const mine = await auditWhen((es) => es.filter((e) => /^bridge\.(get|pull|exec)$/.test(e.tool) && /g15/.test(e.what ?? "") && !/g15-first/.test(e.what ?? "")),
+    (got) => got.length >= seconds.length && got.every((e) => e.done));
+  assert.equal(mine.length, seconds.length);
+  assert.deepEqual(mine.map((e) => [e.tool, e.what, e.ok, e.err]).filter(([, , ok, err]) => ok !== false || err !== "the client disconnected"), [], "none of them is on record as delivered");
+  const first = await auditWhen((es) => es.filter((e) => e.tool === "bridge.exec" && /g15-first/.test(e.what ?? "")), (got) => got.length >= seconds.length && got.every((e) => e.done));
+  assert.deepEqual([...new Set(first.map((e) => `${e.ok} ${e.err}`))], ["false the client disconnected"], "and neither is the answer before them");
+  // and each was over at once, not only when a safety timer ran out (the client left after 0.6 s)
+  assert.deepEqual([...mine, ...first].filter((e) => !(e.ms < 2500)).map((e) => `${e.tool} ${e.what}: ${e.ms} ms`), []);
+  rmSync(file); rmSync(tree, { recursive: true });
 });
 
 // ═════════════════════════ v1.3: fewer round trips - batch, quiet output, server instructions ═════════════════════════
@@ -1901,14 +2098,30 @@ async function realSshd(options = {}) {
   writeFileSync(s.authorized, "");
   writeFileSync(s.log, "");
   if (process.getuid?.() === 0) mkdirSync("/run/sshd", { recursive: true }); // sshd wants this directory when it runs as root
-  s.stop = async () => { const p = s.proc; if (!p) return; s.proc = null; const gone = new Promise((r) => p.once("exit", r)); p.kill("SIGTERM"); await gone; };
+  // The processes sshd runs for its open connections (its children; newer versions put the work into grandchildren).
+  const serving = (all) => {
+    if (!s.proc) return [];
+    const kids = new Map();
+    for (const line of execFileSync("ps", ["-eo", "pid=,ppid="]).toString().trim().split("\n")) {
+      const [pid, parent] = line.trim().split(/\s+/).map(Number);
+      kids.set(parent, [...(kids.get(parent) ?? []), pid]);
+    }
+    const found = [];
+    (function walk(pid, deep) { for (const k of kids.get(pid) ?? []) { found.push(k); if (deep) walk(k, deep); } })(s.proc.pid, all);
+    return found;
+  };
+  const signal = (pids, sig) => { for (const pid of pids) try { process.kill(pid, sig); } catch { /* already gone */ } };
+  s.dropConnections = () => signal(serving(true), "SIGKILL");   // every connection ends at once: the machine went away
+  s.freezeConnections = () => signal(serving(true), "SIGSTOP"); // they stay open but silent: the machine hangs, or the network swallows everything
+  s.dropMonitors = () => signal(serving(false), "SIGKILL");     // only sshd's own process per connection: with newer versions the connection stands, but can start nothing
+  s.stop = async () => { const p = s.proc; if (!p) return; s.dropConnections(); s.proc = null; const gone = new Promise((r) => p.once("exit", r)); p.kill("SIGTERM"); await gone; };
   // (re)start it, on the same port: kex = the only key exchange it offers, forwarding = AllowTcpForwarding, hostKey = which of its
   // two host keys, listen = the addresses it listens on
-  s.start = async ({ kex, forwarding = true, hostKey = "a", listen = ["127.0.0.1", "127.0.0.2"] } = {}) => {
+  s.start = async ({ kex, forwarding = true, hostKey = "a", listen = ["127.0.0.1", "127.0.0.2"], extra = [] } = {}) => {
     await s.stop();
     writeFileSync(path.join(dir, "sshd_config"), [`Port ${port}`, ...listen.map((a) => `ListenAddress ${a}`), `HostKey ${path.join(dir, `host-${hostKey}`)}`, "PidFile none",
       `AuthorizedKeysFile ${s.authorized}`, "StrictModes no", "UsePAM no", "PasswordAuthentication no", "KbdInteractiveAuthentication no", "PermitRootLogin yes", "LogLevel DEBUG1",
-      "Subsystem sftp internal-sftp", `AllowTcpForwarding ${forwarding ? "yes" : "no"}`, ...(kex ? [`KexAlgorithms ${kex}`] : []), ""].join("\n"));
+      "Subsystem sftp internal-sftp", `AllowTcpForwarding ${forwarding ? "yes" : "no"}`, ...(kex ? [`KexAlgorithms ${kex}`] : []), ...extra, ""].join("\n"));
     const from = s.mark(), fd = openSync(s.log, "a");
     s.proc = spawn(SSHD_BIN, ["-D", "-e", "-f", path.join(dir, "sshd_config")], { stdio: ["ignore", fd, fd] });
     closeSync(fd);
@@ -2000,7 +2213,7 @@ test("K2 every kind of call works through it - commands, files, parallel command
   assert.match(b.text, /from-batch[\s\S]*batch: 2 ok, 0 failed, 0 skipped/, b.text);
 
   // the bridge: 3 MB of random bytes there and back, and a command with a lot of output
-  const br = BR ?? (await call("bridge", { ttl_hours: 1 })).text.match(/(http:\/\/127\.0\.0\.1:\d+\/b\/[0-9a-z]+\.[0-9a-f]{32})\/cli/)[1];
+  const br = await bridgeBase();
   const data = randomBytes(3 * 1024 * 1024), remote = path.join(d, "blob.bin");
   const put = await fetch(`${br}/fs/${host}?p64=${p64(remote)}`, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: data });
   assert.equal(put.status, 200, await put.text());
@@ -2015,7 +2228,7 @@ test("K2 every kind of call works through it - commands, files, parallel command
   await sleep(300); // the last connections are logged as they close
   const log = realA.since(mark), outside = count(log, /^Connection from \S+ port \d+ on 127\.0\.0\.2 port/gm), inside = count(log, /^Connection from \S+ port \d+ on 127\.0\.0\.1 port/gm);
   const pq = count(log, new RegExp(`kex: algorithm: (${PQ_NAMES.map((n) => n.replace(/[.]/g, "\\.")).join("|")}) `, "g")), all = count(log, /kex: algorithm: \S+ /g);
-  assert.ok(outside >= 15, `connections from outside: ${outside}`);
+  assert.ok(outside >= 1, `connections from outside: ${outside}`);
   assert.equal(pq, outside, "every connection that came in from outside negotiated a post-quantum key exchange");
   assert.equal(all - pq, inside, "the only classical key exchanges are the inner connections, on the server's own loopback address");
 });
@@ -2133,7 +2346,8 @@ test("K7 a host written into hosts.json by hand becomes post-quantum with \"pq\"
     const mark = realA.mark();
     assert.equal((await call("bash", { host: "by-hand", command: "echo by-hand-ok" })).text, "by-hand-ok\n");
     const seen = wire(realA.since(mark)).filter((c) => c.on === "127.0.0.2" && c.login);
-    assert.ok(seen.length === 1 && isPq(seen[0].kex), JSON.stringify(seen));
+    assert.ok(seen.length <= 1 && seen.every((c) => isPq(c.kex)), JSON.stringify(seen)); // at most one new connection: an open one to that server and login is reused
+    assert.ok(PQ_HERE.includes(auditEntries().find((e) => e.host === "by-hand" && e.what === "echo by-hand-ok").kex), "the call itself went over a post-quantum key exchange");
     const pin = await call("bash", { host: "no-pin", command: "true" });
     assert.deepEqual([pin.isError, /hostFingerprint/.test(pin.text)], [true, true], pin.text);
     const pass = await call("bash", { host: "with-pass", command: "true" });
@@ -2168,7 +2382,110 @@ test("K8 where the server's own SSH is not at its loopback address and that port
   await realB.start();
 });
 
-test("K9 the audit log records the key exchange of each call, and no helper process is left behind", { skip: NO_REAL }, async () => {
+// ── v1.7: the post-quantum connection is kept and shared ──
+const helpers = () => pgrep("HostKeyAlias=sshmcp-").split("\n").filter(Boolean).length;
+const idle = async () => { for (let i = 0; i < 100 && helpers(); i++) await sleep(100); assert.equal(helpers(), 0, "connections that are not used are closed after the keep time"); };
+const logins = (log) => wire(log).filter((c) => c.login && !c.inner);
+
+test("K9 calls to a post-quantum host share its connection: one for calls in a row, a few when many run at once", { skip: NO_REAL }, async () => {
+  await idle();
+  const mark = realA.mark();
+  for (let i = 0; i < 6; i++) assert.equal((await call("bash", { host: "pq-1", command: `echo row-${i}` })).text, `row-${i}\n`);
+  assert.equal((await call("sftp_write", { host: "pq-1", path: P("k9.txt"), content: "x" })).isError, false);
+  assert.equal((await call("read", { host: "pq-1", file_path: P("k9.txt") })).isError, false);
+  let seen = logins(realA.since(mark));
+  assert.equal(seen.length, 1, `eight calls, one connection: ${JSON.stringify(seen)}`);
+  assert.ok(isPq(seen[0].kex));
+  const es = auditEntries().filter((e) => e.host === "pq-1" && /^echo row-/.test(e.what ?? ""));
+  assert.ok(es.length === 6 && es.every((e) => PQ_HERE.includes(e.kex)), "every call still has its key exchange on record");
+
+  const many = await call("ssh_exec_many", { host: "pq-1", commands: Array.from({ length: 10 }, (_, n) => ({ id: `p${n}`, command: `sleep 0.3; echo at-once-${n}` })) });
+  for (let n = 0; n < 10; n++) assert.match(many.text, new RegExp(`at-once-${n}\\b`), many.text);
+  // connections that are set up at the same moment are interleaved in the log, so here they are counted, not followed one by one
+  const log = realA.since(mark), outside = count(log, /^Connection from \S+ port \d+ on 127\.0\.0\.2 port/gm);
+  assert.ok(outside >= 2 && outside <= 3, `ten at once: up to four calls per connection, so three connections in all: ${outside}`);
+  assert.equal(count(log, new RegExp(`kex: algorithm: (${PQ_NAMES.map((n) => n.replace(/[.]/g, "\\.")).join("|")}) `, "g")), outside, "each of them over a post-quantum key exchange");
+});
+
+test("K10 an unused connection is closed after the keep time, and one that died is replaced without the caller noticing", { skip: NO_REAL }, async () => {
+  await idle(); // the ones from K9 are gone by themselves
+  let mark = realA.mark();
+  assert.equal((await call("bash", { host: "pq-1", command: "echo after-idle" })).text, "after-idle\n");
+  assert.equal(logins(realA.since(mark)).length, 1, "a new connection is made when needed");
+
+  realA.dropConnections(); // the server side ends every connection it has: a restart of that machine, a network that drops
+  mark = realA.mark();
+  assert.equal((await call("bash", { host: "pq-1", command: "echo after-drop" })).text, "after-drop\n");
+  assert.equal((await call("ssh_exec", { host: "pq-1", command: "echo again" })).text.startsWith("exit: 0\n--- stdout ---\nagain\n"), true);
+  const seen = logins(realA.since(mark));
+  assert.ok(seen.length === 1 && isPq(seen[0].kex), JSON.stringify(seen));
+
+  // A connection that still stands but can no longer start anything is not kept in use either.
+  realA.dropMonitors();
+  mark = realA.mark();
+  assert.equal((await call("bash", { host: "pq-1", command: "echo after-half-drop" })).text, "after-half-drop\n");
+  assert.equal((await call("bash", { host: "pq-1", command: "echo and-once-more" })).text, "and-once-more\n");
+  assert.equal(logins(realA.since(mark)).length, 1, "one new connection, used by both");
+
+  // The hard case: the connection looks alive, but nothing answers on it any more. The call waits until that is
+  // certain (about 15 s of unanswered keepalives), then runs on a new connection - once, and without an error.
+  realA.freezeConnections();
+  mark = realA.mark();
+  const t0 = Date.now(), counter = P("k10-ran");
+  try {
+    const r = await call("bash", { host: "pq-1", command: `echo x >> ${counter}; echo after-freeze` });
+    assert.equal(r.text, "after-freeze\n", r.text);
+    assert.equal(readFileSync(counter, "utf8"), "x\n", "the command ran exactly once");
+    assert.ok(Date.now() - t0 > 5000 && Date.now() - t0 < 40_000, `it took ${Date.now() - t0} ms`);
+    assert.equal(logins(realA.since(mark)).length, 1);
+  } finally { realA.dropConnections(); }
+});
+
+test("K11 one call that is cut off - a timeout, a client that leaves - does not disturb another call on the same connection", { skip: NO_REAL }, async () => {
+  await idle();
+  const mark = realA.mark(), br = BR ?? (await call("bridge", { ttl_hours: 1 })).text.match(/(http:\/\/127\.0\.0\.1:\d+\/b\/[0-9a-z]+\.[0-9a-f]{32})\/cli/)[1];
+  assert.equal((await call("bash", { host: "pq-1", command: "echo warm" })).text, "warm\n"); // the connection all of the following share
+  const leaves = new AbortController();
+  const [steady, cut, left] = await Promise.all([
+    call("bash", { host: "pq-1", command: "sleep 2.5; echo undisturbed" }),
+    call("bash", { host: "pq-1", command: "echo begun; sleep 31.7", timeout: 1000 }),
+    fetch(`${br}/exec/pq-1`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: "sleep 32.9", signal: leaves.signal }).then(() => "answered", () => "left"),
+    sleep(600).then(() => leaves.abort()),
+  ]);
+  assert.equal(steady.text, "undisturbed\n");
+  assert.match(cut.text, /begun/);
+  assert.match(cut.text, /timed out|timeout/i, cut.text);
+  assert.equal(left, "left");
+  assert.equal((await call("bash", { host: "pq-1", command: "echo and-after" })).text, "and-after\n");
+  assert.equal(logins(realA.since(mark)).length, 1, "all of it on one connection");
+});
+
+test("K12 a server that takes one session per connection (MaxSessions 1) still works: calls that overlap get a connection each", { skip: NO_REAL }, async () => {
+  await realB.start({ extra: ["MaxSessions 1"] });
+  const at = { name: "one-session", host: "127.0.0.2", port: realB.port, username: ME, fingerprint: realB.fp };
+  assert.match((await call("add_host", at)).text, /^Key exchange: \S+ \(post-quantum\)/m);
+  const mark = realB.mark();
+  for (let i = 0; i < 3; i++) assert.equal((await call("bash", { host: "one-session", command: `echo single-${i}` })).text, `single-${i}\n`);
+  assert.equal(logins(realB.since(mark)).length, 1, "calls in a row still share the connection");
+  const many = await call("ssh_exec_many", { host: "one-session", commands: [0, 1, 2, 3].map((n) => ({ id: `m${n}`, command: `sleep 0.4; echo overlap-${n}` })) });
+  for (let n = 0; n < 4; n++) assert.match(many.text, new RegExp(`overlap-${n}\\b`), many.text);
+  assert.equal(count(many.text, /exit: 0/g), 4, many.text);
+  const again = await call("ssh_exec_many", { host: "one-session", commands: [0, 1, 2].map((n) => ({ id: `n${n}`, command: `echo second-round-${n}` })) });
+  assert.equal(count(again.text, /exit: 0/g), 3, again.text); // by now it knows this server's limit
+  await realB.start();
+});
+
+test("K13 PQ_SSH_KEEP=0: nothing is kept, every call makes its own connection", { skip: NO_REAL }, async () => {
+  const base = `http://127.0.0.1:18798/mcp/${SECRET}`;
+  await startServer(18798, { PQ_SSH_KEEP: "0" });
+  await idle();
+  const mark = realA.mark();
+  for (let i = 0; i < 3; i++) assert.equal((await call("bash", { host: "pq-1", command: `echo own-${i}` }, base)).text, `own-${i}\n`);
+  assert.equal(logins(realA.since(mark)).length, 3);
+  assert.equal(helpers(), 0, "and none is left open");
+});
+
+test("K14 the audit log records the key exchange of each call, and no helper process is left behind", { skip: NO_REAL }, async () => {
   const es = auditEntries().filter((e) => e.host === "pq-1" && e.done);
   const through = es.find((e) => e.what === "echo through-pq; id -un");
   assert.ok(through && PQ_HERE.includes(through.kex), JSON.stringify(through));
@@ -2177,6 +2494,6 @@ test("K9 the audit log records the key exchange of each call, and no helper proc
   const shown = (await call("audit", { contains: "through-pq", limit: 5 })).text;
   assert.match(shown, /  bash  pq-1 \(pq\)  ok  /, shown);
   let left = "";
-  for (let i = 0; i < 50; i++) { left = pgrep("HostKeyAlias=sshmcp-"); if (!left) break; await sleep(100); }
+  for (let i = 0; i < 80; i++) { left = pgrep("HostKeyAlias=sshmcp-"); if (!left) break; await sleep(100); } // connections are kept for 3 s here
   assert.equal(left, "", "OpenSSH helper processes still running");
 });

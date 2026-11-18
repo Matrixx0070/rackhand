@@ -4,7 +4,7 @@ import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { Client, type ConnectConfig, type ParsedKey } from "ssh2";
+import { Client, type ClientChannel, type ConnectConfig, type ParsedKey, type SFTPWrapper } from "ssh2";
 import { exec, execFile, spawn } from "node:child_process";
 import { readFileSync, promises as fs } from "node:fs";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
@@ -23,7 +23,7 @@ const HOSTS_FILE = process.env.HOSTS_FILE ?? "./hosts.json";
 const MAX_OUT = 100_000;
 const JOBS_DIR = process.env.JOBS_DIR ?? "/var/lib/ssh-mcp/jobs"; // ssh_spawn: <jobId>.log / .exit / .pid / .cmd / .sh
 const MAX_PAYLOAD = 64 * 1024; // bytes of command/code sent inline (base64) in one shell argument
-const VERSION = "1.6.1";
+const VERSION = "1.7.0";
 // Sent to the client at initialize; clients put it in front of the model. Keep it short: it costs tokens in every conversation.
 const INSTRUCTIONS = `Remote shell and files on the hosts from list_hosts ("local" = the machine this connector runs on).
 Every tool call is a round trip, so do as much as possible per call:
@@ -224,16 +224,118 @@ function carried(o: PqTarget & { via: string; privateKey: Buffer }): Promise<Car
     c.on("ready", () => ready(10));
     c.on("error", (e: Error & { level?: string }) => fail(e));
     c.on("close", () => fail(null));
-    c.connect({ sock, username: o.username, privateKey: o.privateKey, readyTimeout: 20_000, keepaliveInterval: 10_000, hostVerifier: (key: Buffer) => fingerprintOf(key) === o.key.fp });
+    c.connect({ sock, username: o.username, privateKey: o.privateKey, readyTimeout: 20_000, keepaliveInterval: 5_000, keepaliveCountMax: 2, hostVerifier: (key: Buffer) => fingerprintOf(key) === o.key.fp });
   }));
 }
-async function carriedTo(cfg: HostCfg, label: string): Promise<Carried> {
+// ── v1.7: the post-quantum connection is kept and shared ─────────────────────────────────────────
+// Making one costs two SSH handshakes, so it is not thrown away after a call. An unused one stays open for
+// PQ_SSH_KEEP seconds (60; 0 = a new one for every call), and up to four calls run on one at the same time.
+// What a caller gets is a lease: it opens its channels on the shared connection and, when the caller is done or
+// gives up, closes those and nothing else.
+const PQ_KEEP = (() => { const v = (process.env.PQ_SSH_KEEP ?? "").trim(), n = Number(v); return v !== "" && Number.isFinite(n) && n >= 0 ? n : 60; })() * 1000;
+const PQ_SHARE = 4; // calls on one connection at a time; a call may hold two channels, and sshd takes 10 per connection unless told otherwise
+// What the code that talks to a host needs from a connection: an ssh2 client of its own, or a lease on a shared one.
+type Conn = {
+  exec(command: string, cb: (err: Error | undefined, stream: ClientChannel) => void): unknown;
+  sftp(cb: (err: Error | undefined, sftp: SFTPWrapper) => void): unknown;
+  end(): unknown;
+  destroy(): unknown;
+};
+type Shared = { ready: Promise<void>; client: Client | null; kex: string; leases: number; cap: number; dead: boolean; idle: NodeJS.Timeout | null; retire(): void };
+const pqPool = new Map<string, Shared[]>(); // by server, login and pinned key
+const pqCap = new Map<string, number>();    // learned about a server that takes fewer sessions per connection than usual
+
+function pqShared(id: string, gate: string, o: PqTarget & { via: string; privateKey: Buffer }): Shared {
+  const list = pqPool.get(id) ?? [];
+  pqPool.set(id, list);
+  const s: Shared = {
+    ready: Promise.resolve(), client: null, kex: "", leases: 0, cap: PQ_KEEP ? Math.min(PQ_SHARE, pqCap.get(id) ?? PQ_SHARE) : 1, dead: false, idle: null,
+    retire() {
+      s.dead = true;
+      if (s.idle) clearTimeout(s.idle);
+      const at = list.indexOf(s);
+      if (at >= 0) list.splice(at, 1);
+      if (!list.length && pqPool.get(id) === list) pqPool.delete(id);
+    },
+  };
+  list.push(s);
+  s.ready = pqGate(gate, () => carried(o)).then(({ client, kex }) => { s.client = client; s.kex = kex; client.on("close", s.retire); }, (e) => { s.retire(); throw e; });
+  s.ready.catch(() => {}); // whoever waits for it gets the reason; nobody waiting is not an error
+  return s;
+}
+function pqRelease(s: Shared): void {
+  if (--s.leases > 0) return;
+  if (s.dead) return void s.client?.end(); // taken out of use while calls were still on it: now it can go
+  const close = () => { if (s.leases > 0 || s.dead) return; s.retire(); s.client?.end(); };
+  if (!PQ_KEEP) return close();
+  s.idle = setTimeout(close, PQ_KEEP);
+  s.idle.unref();
+}
+// A lease on `first`. `another` gives a connection of its own, for the one case a call is moved: it could not
+// even start on the shared one, because that had died unnoticed or the server takes fewer sessions than assumed.
+// If no other connection can be made either, `explain` turns the reason for that into the error the caller gets.
+function pqLeaseOn(first: Shared, id: string, another: () => Promise<Shared>, explain: (e: unknown) => Error): Conn {
+  let cur = first, done = false, opened = 0;
+  const mine = new Set<() => void>(); // how to close each channel this lease still has open
+  const open = <T extends { once(event: "close", fn: () => void): unknown }>(start: (c: Client, cb: (err: Error | undefined, ch: T) => void) => void,
+    shut: (ch: T) => void, cb: (err: Error | undefined, ch: T) => void, again = true): void => {
+    if (done) return void cb(new Error("this connection was already given back"), undefined as never);
+    const on = cur;
+    start(on.client!, (err, ch) => {
+      if (err) {
+        if (!again || opened > 0 || done) return void cb(err, ch);
+        if ((err as { reason?: unknown }).reason === undefined) on.retire(); // it stands, but starts nothing any more: no further call is put on it
+        else if (on.leases > 1) { // the server refused one more session on this connection: remember how many it takes
+          on.cap = Math.max(1, on.leases - 1);
+          pqCap.set(id, Math.min(pqCap.get(id) ?? PQ_SHARE, on.cap));
+        }
+        return void another().then((s) => {
+          if (done) return pqRelease(s);
+          pqRelease(on);
+          cur = s;
+          open(start, shut, cb, false);
+        }, (e) => cb(explain(e), ch));
+      }
+      opened++;
+      const close = () => shut(ch);
+      mine.add(close);
+      ch.once("close", () => mine.delete(close));
+      if (done) close(); // the caller gave up while the channel was being opened
+      cb(undefined, ch);
+    });
+  };
+  const finish = () => {
+    if (done) return;
+    done = true;
+    for (const close of [...mine]) { try { close(); } catch { /* already gone */ } }
+    pqRelease(cur);
+  };
+  return {
+    exec: (command, cb) => open<ClientChannel>((c, got) => c.exec(command, got), (ch) => ch.close(), cb),
+    sftp: (cb) => open<SFTPWrapper>((c, got) => c.sftp(got), (sftp) => sftp.end(), cb),
+    end: finish,
+    destroy: finish,
+  };
+}
+async function pqLease(cfg: HostCfg, label: string): Promise<Conn> {
   if (!cfg.hostFingerprint) throw new Error(`"${label}" has "pq": true but no hostFingerprint: a post-quantum connection needs the host key to be pinned.`);
   if (!cfg.privateKeyPath || cfg.passphraseEnv || cfg.passwordEnv) throw new Error(`"${label}" has "pq": true, which needs privateKeyPath to be a key file without a passphrase (no passphraseEnv, no passwordEnv).`);
   const kex = await pqHere();
   if (!kex.length) throw pqFail("nossh", "this machine has no OpenSSH client with post-quantum key exchange");
-  const key = await pinnedKey(cfg), port = cfg.port ?? 22, privateKey = readFileSync(cfg.privateKeyPath);
-  return pqGate(`${cfg.host}:${port}`, () => carried({ host: cfg.host!, port, via: cfg.pqVia ?? `127.0.0.1:${port}`, username: cfg.username ?? "", keyPath: cfg.privateKeyPath!, privateKey, key, kex }));
+  const key = await pinnedKey(cfg), port = cfg.port ?? 22, via = cfg.pqVia ?? `127.0.0.1:${port}`, keyPath = cfg.privateKeyPath, username = cfg.username ?? "";
+  const id = [cfg.host, port, via, username, keyPath, key.fp].join("|");
+  const take = async (own: boolean): Promise<Shared> => {
+    const s = (own ? undefined : pqPool.get(id)?.find((x) => !x.dead && x.leases < x.cap))
+      ?? pqShared(id, `${cfg.host}:${port}`, { host: cfg.host!, port, via, username, keyPath, privateKey: readFileSync(keyPath), key, kex });
+    s.leases++;
+    if (s.idle) { clearTimeout(s.idle); s.idle = null; }
+    try { await s.ready; } catch (e) { s.leases--; throw e; }
+    if (s.dead) { s.leases--; return take(true); } // it closed while this call was waiting for it
+    return s;
+  };
+  const first = await take(false);
+  auditNote({ kex: first.kex });
+  return pqLeaseOn(first, id, () => take(true), (e) => (isPqFail(e) ? pqError(label, cfg, e) : e instanceof Error ? e : new Error(String(e))));
 }
 function pqError(label: string, cfg: HostCfg, f: PqFail): Error {
   const at = `${cfg.host}:${cfg.port ?? 22}`;
@@ -245,14 +347,11 @@ function pqError(label: string, cfg: HostCfg, f: PqFail): Error {
     `It does not fall back by itself. If the change is lasting and a classical key exchange is acceptable for this host, set "pq": false for it in ${resolvePath(HOSTS_FILE)} or add it again with add_host (replace: true).`);
 }
 
-async function connect(cfg: HostCfg, name = ""): Promise<Client> {
+async function connect(cfg: HostCfg, name = ""): Promise<Conn> {
   const label = name || String(cfg.host);
   if (cfg.pq === true && PQ_MODE !== "off") {
-    try {
-      const { client, kex } = await carriedTo(cfg, label);
-      auditNote({ kex });
-      return client;
-    } catch (e) { throw isPqFail(e) ? pqError(label, cfg, e) : e; }
+    try { return await pqLease(cfg, label); }
+    catch (e) { throw isPqFail(e) ? pqError(label, cfg, e) : e; }
   }
   if (PQ_MODE === "require") throw new Error(`"${label}" is not a post-quantum host, and this connector only connects to hosts that are (PQ_SSH=require). Add it again with add_host (replace: true): that tries post-quantum key exchange first.`);
   const opts: ConnectConfig = {
@@ -270,7 +369,7 @@ async function connect(cfg: HostCfg, name = ""): Promise<Client> {
     opts.hostVerifier = (key: Buffer) =>
       createHash("sha256").update(key).digest("base64").replace(/=+$/, "") === want;
   }
-  return new Promise((resolve, reject) => {
+  return new Promise<Conn>((resolve, reject) => {
     const c = new Client();
     c.on("ready", () => resolve(c)).on("error", reject).connect(opts);
   });
@@ -668,8 +767,16 @@ type StreamResult = { code: number | null; stderr: string; aborted: boolean };
 function streamExec(name: string, script: string, stdin: Readable | null, stdout: Writable): Promise<StreamResult> {
   const cfg = getHost(name);
   return new Promise<StreamResult>((resolve, reject) => {
-    let stderr = "", aborted = false, settled = false, kill = () => {};
-    const abort = () => { if (settled || aborted) return; aborted = true; kill(); setTimeout(() => finish(null), 5000).unref(); };
+    let stderr = "", aborted = false, settled = false, kill = () => {}, src: Readable | null = null;
+    const abort = () => {
+      if (settled || aborted) return;
+      aborted = true;
+      // The output was going to `stdout` and has stopped with it; whatever is still on its way now runs off to nowhere,
+      // so the end of the script is seen as soon as it is gone, and its pipe or channel is closed.
+      if (src) { src.unpipe(stdout); src.resume(); }
+      kill();
+      setTimeout(() => finish(null), 5000).unref();
+    };
     const inClosed = () => { if (!stdin!.readableEnded) abort(); };
     const cleanup = () => { settled = true; stdout.off("close", abort); stdin?.off("close", inClosed); };
     const finish = (code: number | null) => { if (settled) return; cleanup(); resolve({ code, stderr, aborted }); };
@@ -684,6 +791,7 @@ function streamExec(name: string, script: string, stdin: Readable | null, stdout
       kill = () => { signal("SIGTERM"); setTimeout(() => signal("SIGKILL"), 2000).unref(); }; // TERM first: lets the script's EXIT trap clean up
       child.on("error", fail);
       child.stderr!.on("data", onErr);
+      src = child.stdout!;
       child.stdout!.pipe(stdout, { end: false });
       if (stdin) { child.stdin!.on("error", () => {}); stdin.pipe(child.stdin!); }
       child.on("close", finish);
@@ -695,6 +803,7 @@ function streamExec(name: string, script: string, stdin: Readable | null, stdout
       conn.exec(`bash -c ${shq(script)}`, (err, stream) => {
         if (err) { conn.end(); return fail(err); }
         stream.stderr.on("data", onErr);
+        src = stream;
         stream.pipe(stdout, { end: false });
         if (stdin) stdin.pipe(stream); else stream.end();
         stream.on("close", (code: number | null) => { conn.end(); finish(code ?? null); });
@@ -1917,25 +2026,56 @@ bridge.get("/cli", guarded(async (req, res) => {
   }, same);
 }));
 
+// Run `fn` when a response is over, one way or the other; `fn` tells by res.writableFinished whether the client has
+// left early. A response that is being sent hears that as its own "close". One that is still waiting its turn on
+// the connection (a client may send several requests at once) hears nothing - only the connection itself does.
+function whenClosed(res: express.Response, fn: () => void): void {
+  const conn = res.req.socket;
+  const once = () => { res.off("close", once); conn.off("close", once); fn(); };
+  res.once("close", once);
+  conn.once("close", once);
+  if (conn.destroyed) queueMicrotask(once);
+}
+
+// What became of a response: "whole" when all of it was handed to the connection, "gone" when the client left
+// first. A script that has exited says nothing about that: the end of its output can still be inside this server,
+// waiting for a reader that is slower than the script was. Call it before the response can end - it listens for that.
+function delivered(res: express.Response): Promise<"whole" | "gone"> {
+  const conn = res.req.socket;
+  return new Promise((resolve) => {
+    res.once("finish", () => resolve(conn.destroyed ? "gone" : "whole")); // a last write cut off by a broken connection still "finishes"
+    whenClosed(res, () => resolve("gone"));                               // after "finish" this changes nothing
+  });
+}
+
 // A response whose length was announced is finished the moment that many bytes have gone out, not when the script
 // that produced them has also exited: a client that closes as soon as it has everything (curl does) must not look
-// like one that broke off. Bytes written to the returned stream go to `res`; `complete` says the whole body went in.
-function sized(res: express.Response, size: number): Transform & { complete: boolean } {
-  let left = size;
+// like one that broke off. Bytes written to the returned stream go to `res`. When the script is done, end() the
+// stream and wait for `fate`: "whole" or "gone" as from delivered(), or
+//   "short"  the stream ended before the announced number of bytes had come - the response is broken off, never ended short
+type Fate = "whole" | "short" | "gone";
+function sized(res: express.Response, size: number): Transform & { fate: Promise<Fate> } {
+  let left = size, complete = false, settle: (fate: Fate) => void = () => {};
+  const fate = new Promise<Fate>((resolve) => { settle = resolve; }); // the first verdict stands
   const out = Object.assign(new Transform({
     transform(chunk: Buffer, _enc, cb) {
-      if (out.complete) return cb();                                      // never more than was announced
+      if (complete) return cb();                                          // never more than was announced
       const part = chunk.length > left ? chunk.subarray(0, left) : chunk;
       left -= part.length;
       if (part.length) this.push(part);
-      if (left === 0) { out.complete = true; this.push(null); }           // end of the body: the pipe ends `res` once all of it is written
+      if (left === 0) { complete = true; this.push(null); }               // end of the body: the pipe ends `res` once all of it is written
       cb();
     },
-  }), { complete: false });
+    flush(cb) {                                                           // end(): everything that was written has been through here
+      if (!complete) { settle("short"); out.unpipe(res); res.destroy(); }
+      cb();
+    },
+  }), { fate });
+  delivered(res).then(settle);                                            // only a complete body is ever ended
   out.on("error", () => {});
-  res.once("close", () => { if (!res.writableFinished) out.destroy(); }); // the client left before it had everything: stop the script
+  whenClosed(res, () => { if (!res.writableFinished) out.destroy(); }); // the client left before it had everything: stop the script
   out.pipe(res);
-  if (size === 0) { out.complete = true; out.push(null); }
+  if (size === 0) { complete = true; out.push(null); }
   return out;
 }
 
@@ -1951,11 +2091,10 @@ bridge.get("/fs/:host", guarded(async (req, res) => {
     const out = sized(res, size);
     const r = await streamExec(host, `head -c ${size} -- ${shq(p)}`, null, out);
     // on failure the client sees a broken transfer, never a silently short file
-    if (r.aborted || r.code !== 0 || !out.complete) {
-      res.destroy();
-      return { ok: false, err: r.aborted ? "the client disconnected" : r.code !== 0 ? `exit ${r.code}` : "the file became shorter while it was being sent", bytes: size };
-    }
+    if (r.aborted || r.code !== 0) { res.destroy(); return { ok: false, err: r.aborted ? "the client disconnected" : `exit ${r.code}`, bytes: size }; }
     out.end();
+    const fate = await out.fate;
+    if (fate !== "whole") return { ok: false, err: fate === "short" ? "the file became shorter while it was being sent" : "the client disconnected", bytes: size };
     return { ok: true, bytes: size };
   }, same);
 }));
@@ -1997,14 +2136,20 @@ bridge.get("/tar/:host", guarded(async (req, res) => {
     const chk = await runScript(host, `[ -d ${shq(dir)} ] && [ -r ${shq(dir)} ]`, 30);
     if (chk.code !== 0) { plain(res, 404, `No such readable directory: ${host}:${dir}`); return { ok: false, err: "no such readable directory" }; }
     res.status(200).set({ "Content-Type": "application/gzip" });
-    const r = await streamExec(host, `tar -C ${shq(dir)} ${ex.map((x) => `--exclude=${shq(x)}`).join(" ")} -czf - .`, null, res);
+    const out = new PassThrough(); // a stream of our own in between: closing it stops tar, also for a response that never got its turn
+    out.on("error", () => {});
+    whenClosed(res, () => { if (!res.writableFinished) out.destroy(); });
+    const fate = delivered(res);
+    out.pipe(res);
+    const r = await streamExec(host, `tar -C ${shq(dir)} ${ex.map((x) => `--exclude=${shq(x)}`).join(" ")} -czf - .`, null, out);
     // tar exits 1 when a file changed while it was read (the archive is still good); anything worse breaks the transfer
     if (r.aborted || r.code === null || r.code > 1) {
       if (!r.aborted) console.error(`tar ${host}:${dir} failed (exit ${r.code}): ${r.stderr.trim()}`);
       res.destroy();
       return { ok: false, err: r.aborted ? "the client disconnected" : `tar failed (exit ${r.code}): ${r.stderr.trim()}` };
     }
-    res.end();
+    out.end(); // the pipe ends the response when the rest of the archive has gone out
+    if ((await fate) !== "whole") return { ok: false, err: "the client disconnected" };
     return { ok: true };
   }, same);
 }));
@@ -2035,7 +2180,7 @@ bridge.post("/exec/:host", express.text({ type: () => true, limit: "1mb" }), gua
     try { tripCheck([{ command }], /^(1|true|yes)$/i.test(qstr(req.query.confirm) ?? ""), "?confirm=1 (box exec -y)"); }
     catch (e) { plain(res, 409, (e as Error).message); return { ok: false, err: (e as Error).message }; }
     // The script answers with one header line, "rc=<exit code> size=<bytes>", then the output itself.
-    let head: Buffer | null = Buffer.alloc(0), started = false, rc: number | null = null, left = 0, complete = false;
+    let head: Buffer | null = Buffer.alloc(0), started = false, rc: number | null = null, left = 0, complete = false, short = false;
     // when the announced body has gone in, the response ends (the pipe ends `res` once all of it is written),
     // whatever the script still does before it exits
     const pass = (t: Transform, bytes: Buffer) => { if (complete) return; left -= bytes.length; if (bytes.length) t.push(bytes); if (left <= 0) { complete = true; t.push(null); } };
@@ -2053,9 +2198,11 @@ bridge.post("/exec/:host", express.text({ type: () => true, limit: "1mb" }), gua
         pass(this, rest);
         cb();
       },
+      flush(cb) { if (started && !complete) { short = true; body.unpipe(res); res.destroy(); } cb(); }, // less output than the script announced: broken off, never ended short
     });
     body.on("error", () => {});
-    res.once("close", () => { if (!res.writableFinished) body.destroy(); }); // the client left before it had everything: stop the script
+    whenClosed(res, () => { if (!res.writableFinished) body.destroy(); }); // the client left before it had everything: stop the script
+    const fate = delivered(res);
     body.pipe(res);
     const r = await streamExec(host, bashScript({ command, timeoutSec: t, cwd, raw: true }), null, body);
     if (!started) {
@@ -2066,6 +2213,8 @@ bridge.post("/exec/:host", express.text({ type: () => true, limit: "1mb" }), gua
     }
     if (r.aborted || r.code !== 0) { res.destroy(); return { ok: false, exit: rc, err: r.aborted ? "the client disconnected" : `the exec script failed (exit ${r.code})` }; }
     body.end();
+    const f = await fate;
+    if (short || f !== "whole") return { ok: false, exit: rc, err: short ? "the output became shorter while it was being sent" : "the client disconnected" };
     return { ok: true, exit: rc };
   }, same);
 }));
