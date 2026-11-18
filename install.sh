@@ -170,7 +170,7 @@ else
       curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=$CARCH" -o /usr/local/bin/caddy
       chmod +x /usr/local/bin/caddy
     fi
-    mkdir -p /etc/caddy
+    mkdir -p /etc/caddy /var/lib/caddy
     MARK="# ssh-mcp ($SVC)"
     if [ -f "$CADDYFILE" ] && grep -qF "$MARK" "$CADDYFILE"; then
       say "Caddyfile already has the $SVC site"
@@ -189,7 +189,11 @@ Wants=network-online.target
 ExecStart=$(command -v caddy) run --config $CADDYFILE --adapter caddyfile
 ExecReload=$(command -v caddy) reload --config $CADDYFILE --adapter caddyfile
 Restart=always
+# certificates in /var/lib/caddy, Caddy's own saved config in /var/lib/caddy/.config (without HOME it would
+# write a "caddy" folder into whatever directory it was started from)
 Environment=XDG_DATA_HOME=/var/lib
+Environment=HOME=/var/lib/caddy
+WorkingDirectory=/var/lib/caddy
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
@@ -229,7 +233,7 @@ else
 fi
 echo "=================================================================="
 echo " Add it as a custom connector / remote MCP server in your AI client (see README)."
-echo " More SSH hosts:  edit $APP/hosts.json (example: $APP/hosts.example.json)"
+echo " More SSH hosts:  ask the assistant to add one (the add_host tool), or edit $APP/hosts.json"
 echo " Logs:            journalctl -u $SVC -f"
 AUDIT=$(journalctl -u "$SVC" -n 50 --no-pager -o cat 2>/dev/null | sed -n 's/^audit log: //p' | tail -1 || true)
 [ -n "$AUDIT" ] && echo " Audit log:       $AUDIT   (every call the connector runs)"

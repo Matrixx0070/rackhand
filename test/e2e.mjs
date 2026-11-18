@@ -35,7 +35,7 @@ const NEW = ["bash", "read", "write", "edit", "bridge"]; // v1.2
 const V13 = ["batch"]; // v1.3
 const V14 = ["audit"]; // v1.4
 const V15 = ["add_host"]; // v1.5
-const VERSION = "1.5.0";
+const VERSION = "1.5.1";
 const ALL_TOOLS = [...OLD, ...NEW, ...V13, ...V14, ...V15];
 const HOSTS = ["local", "remote"];
 const MAX_OUT = 100_000;
@@ -45,9 +45,18 @@ writeFileSync(SERVER_LOG, "");
 let sshd, sshd2, servers = [];
 
 // authorizedFile: accept only the public keys listed in that file (read on every login); without it, any key.
+// ssh2 1.17's generator drops a leading zero byte of an ed25519 public key, so about 1 key in 256 is one its own
+// parser refuses ("Malformed OpenSSH private key"). The tests only start from keys that can be read ...
+function keyPair() {
+  for (;;) { const k = utils.generateKeyPairSync("ed25519"); if (!(utils.parseKey(k.private) instanceof Error)) return k; }
+}
+// ... except where a test wants exactly such a key.
+function unreadableKeyPair() {
+  for (let i = 0; i < 100_000; i++) { const k = utils.generateKeyPairSync("ed25519", { comment: "ssh-mcp@old" }); if (utils.parseKey(k.private) instanceof Error) return k; }
+  throw new Error("the key generator made no unreadable key in 100000 tries");
+}
 function startSshd({ authorizedFile } = {}) {
-  const host = utils.generateKeyPairSync("ed25519");
-  const client = utils.generateKeyPairSync("ed25519");
+  const host = keyPair(), client = keyPair();
   if (!authorizedFile) writeFileSync(path.join(TMP, "client"), client.private, { mode: 0o600 });
   const fp = "SHA256:" + createHash("sha256").update(utils.parseKey(host.private).getPublicSSH()).digest("base64").replace(/=+$/, "");
   const stats = { logins: 0 }; // public-key login attempts this server was offered
@@ -1784,4 +1793,33 @@ test("H5 add_host: the pinned host key is enforced - if another server answers a
     assert.equal(existsSync(marker), false);
     assert.match((await call("ssh_exec", { host: "web-2", command: "echo pinned-ok" })).text, /pinned-ok/); // the right server still works
   } finally { writeFileSync(file, before); }
+});
+
+test("H6 add_host: a connector key that cannot be read is set aside and a new one made - the generator's bad keys never reach a server", async () => {
+  const port = 18795, base = `http://127.0.0.1:${port}/mcp/${SECRET}`, dir = P("h6", "keys");
+  const bad = unreadableKeyPair(); // what about 1 install in 256 would have got from the key generator
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "id_ed25519"), bad.private, { mode: 0o600 });
+  writeFileSync(path.join(dir, "id_ed25519.pub"), bad.public + "\n");
+  writeFileSync(P("h6", "hosts.json"), JSON.stringify({ local: { local: true } }));
+  await startServer(port, { JOBS_DIR: P("h6", "jobs"), HOSTS_FILE: P("h6", "hosts.json") });
+  const at = { name: "h6", host: "127.0.0.1", port: sshd2.port, username: "deploy" };
+
+  const first = await call("add_host", at, base);
+  assert.equal(first.isError, false, first.text);
+  assert.match(first.text, /^Not added yet: /);
+  const key = utils.parseKey(readFileSync(path.join(dir, "id_ed25519")));
+  assert.ok(!(key instanceof Error), "the key in use can be read");
+  const line = readFileSync(path.join(dir, "id_ed25519.pub"), "utf8").trim();
+  assert.equal(Buffer.from(line.split(" ")[1], "base64").length, 51, "its public key is a whole ed25519 key (32 bytes)");
+  assert.ok(Buffer.from(line.split(" ")[1], "base64").equals(key.getPublicSSH()), "the .pub line belongs to the private key");
+  assert.ok(first.text.includes(line) && !first.text.includes(bad.public.split(" ")[1]), "the line shown to the user is the new key, not the unreadable one");
+  const aside = readdirSync(dir).filter((f) => f.startsWith("id_ed25519.unusable-")).sort();
+  assert.equal(aside.length, 2, `the old pair is kept aside, not deleted: ${readdirSync(dir)}`);
+  assert.equal(readFileSync(path.join(dir, aside[0]), "utf8"), bad.private);
+
+  appendFileSync(P("authorized_keys"), line + "\n");
+  assert.match((await call("add_host", { ...at, fingerprint: sshd2.fp }, base)).text, /^Added host "h6": deploy@/);
+  assert.match((await call("ssh_exec", { host: "h6", command: "echo with-the-new-key" }, base)).text, /with-the-new-key/);
+  assert.deepEqual(readdirSync(dir).filter((f) => f.startsWith("id_ed25519.unusable-")).sort(), aside, "a good key is left alone on later calls");
 });

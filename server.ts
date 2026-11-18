@@ -4,7 +4,7 @@ import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { Client, type ConnectConfig } from "ssh2";
+import { Client, type ConnectConfig, type ParsedKey } from "ssh2";
 import { exec, spawn } from "node:child_process";
 import { readFileSync, promises as fs } from "node:fs";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
@@ -23,7 +23,7 @@ const HOSTS_FILE = process.env.HOSTS_FILE ?? "./hosts.json";
 const MAX_OUT = 100_000;
 const JOBS_DIR = process.env.JOBS_DIR ?? "/var/lib/ssh-mcp/jobs"; // ssh_spawn: <jobId>.log / .exit / .pid / .cmd / .sh
 const MAX_PAYLOAD = 64 * 1024; // bytes of command/code sent inline (base64) in one shell argument
-const VERSION = "1.5.0";
+const VERSION = "1.5.1";
 // Sent to the client at initialize; clients put it in front of the model. Keep it short: it costs tokens in every conversation.
 const INSTRUCTIONS = `Remote shell and files on the hosts from list_hosts ("local" = the machine this connector runs on).
 Every tool call is a round trip, so do as much as possible per call:
@@ -974,6 +974,24 @@ const CONFIRM = "Set true to run a command that the server refused as catastroph
 // There is no password path on purpose: the one manual step is adding the public key on the new server.
 let serialQueue: Promise<unknown> = Promise.resolve();
 const serial = <T>(fn: () => Promise<T>): Promise<T> => { const p = serialQueue.then(fn, fn); serialQueue = p.catch(() => {}); return p; }; // one at a time
+// The key as ssh2 reads it, if it can be read AND really signs; null otherwise.
+function usableKey(privateKey: string | Buffer): ParsedKey | null {
+  const parsed = sshUtils.parseKey(privateKey), k = Array.isArray(parsed) ? parsed[0] : parsed;
+  if (!k || k instanceof Error) return null;
+  const probe = Buffer.from("ssh-mcp key check"), signature = k.sign(probe);
+  return !(signature instanceof Error) && k.verify(probe, signature) === true ? k : null;
+}
+// A new ed25519 key pair. ssh2 1.17's generator drops a leading zero byte of the public key, so about 1 key in
+// 256 comes out as one that nothing can read, ssh2 itself included. Such a key must never be saved: it would make
+// add_host fail for good, and the line shown to the user would be refused by every SSH server.
+function newKeyPair(comment: string): { private: string; public: string } {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const pair = sshUtils.generateKeyPairSync("ed25519", { comment });
+    const k = usableKey(pair.private), blob = Buffer.from(pair.public.split(" ")[1] ?? "", "base64");
+    if (k && blob.length === 51 && blob.equals(k.getPublicSSH())) return pair; // 51 = "ssh-ed25519" + a whole 32-byte key
+  }
+  throw new Error("could not generate a usable SSH key");
+}
 async function connectorKey(): Promise<{ path: string; privateKey: Buffer; publicKey: string }> {
   let last: unknown;
   for (const dir of [join(dirname(JOBS_DIR), "keys"), join(homedir(), ".ssh-mcp", "keys")]) {
@@ -981,18 +999,24 @@ async function connectorKey(): Promise<{ path: string; privateKey: Buffer; publi
       const path = join(dir, "id_ed25519");
       await mkdirp(dir);
       await fs.chmod(dir, 0o700);
+      const existing = await fs.readFile(path).catch(() => null);
+      if (existing && !usableKey(existing)) { // a key nothing can read never logged in anywhere: keep it aside, make a new one
+        const aside = `${path}.unusable-${Date.now()}`;
+        await fs.rename(path, aside);
+        await fs.rename(`${path}.pub`, `${aside}.pub`).catch(() => {});
+      }
       if (!(await fs.stat(path).catch(() => null))) {
-        const pair = sshUtils.generateKeyPairSync("ed25519", { comment: `ssh-mcp@${hostname()}` });
+        const pair = newKeyPair(`ssh-mcp@${hostname()}`);
         const created = await fs.writeFile(path, pair.private, { mode: 0o600, flag: "wx" }).then(() => true, (e: NodeJS.ErrnoException) => { if (e.code !== "EEXIST") throw e; return false; });
         if (created) await fs.writeFile(`${path}.pub`, `${pair.public}\n`, { mode: 0o644 }); // otherwise another process made the key a moment ago: use that one
       }
-      const privateKey = await fs.readFile(path);
-      let publicKey = (await fs.readFile(`${path}.pub`, "utf8").catch(() => "")).trim();
-      if (!publicKey) { // the .pub file is gone: work it out from the private key
-        const parsed = sshUtils.parseKey(privateKey), k = Array.isArray(parsed) ? parsed[0] : parsed;
-        if (k instanceof Error) throw k;
-        publicKey = `${k.type} ${k.getPublicSSH().toString("base64")} ssh-mcp@${hostname()}`;
-      }
+      const privateKey = await fs.readFile(path), k = usableKey(privateKey);
+      if (!k) throw new Error(`the key in ${path} cannot be read`);
+      // The line to show is worked out from the private key; the .pub file only supplies the comment, and is put right if it says otherwise.
+      const onDisk = (await fs.readFile(`${path}.pub`, "utf8").catch(() => "")).trim().split(/\s+/);
+      const blob = k.getPublicSSH().toString("base64");
+      const publicKey = `${k.type} ${blob} ${onDisk[1] === blob && onDisk[2] ? onDisk.slice(2).join(" ") : `ssh-mcp@${hostname()}`}`;
+      if (onDisk[1] !== blob) await fs.writeFile(`${path}.pub`, `${publicKey}\n`, { mode: 0o644 });
       return { path, privateKey, publicKey };
     } catch (e) { last = e; }
   }

@@ -16,7 +16,7 @@ ssh-mcp on your VPS ──SSH/SFTP──▶ any host in hosts.json
 > On AWS EC2, anyone with the URL can also use the instance's IAM role - check what that role allows
 > before you install (see [Security](#security)).
 
-18 tools, one install command, no account, no database. Version 1.5.0.
+18 tools, one install command, no account, no database. Version 1.5.1.
 
 ## Quick start
 
@@ -304,7 +304,7 @@ Found a security problem? Please report it privately (GitHub: Security → Repor
 ```bash
 npm ci
 npm run typecheck
-npm test          # 143 black-box tests over the HTTP endpoint, against "local" and an in-process SSH server
+npm test          # 144 black-box tests over the HTTP endpoint, against "local" and an in-process SSH server
 ```
 
 The whole server is one file, [`server.ts`](server.ts), run with `tsx`; [`box.sh`](box.sh) is the bridge client the

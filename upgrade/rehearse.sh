@@ -1,8 +1,9 @@
 #!/bin/bash
 # rehearse.sh [all|setup|R|A|S|O|B|cleanup]
 # Full rehearsal of deploy.sh against a throwaway copy of the connector as it is in production RIGHT NOW:
-# the live server.ts, a real unit file shaped like the production one (with the keep-workloads drop-in when
-# production has it), its own port and directory, and dummy workloads started through the old connector.
+# the live server.ts, a copy of the live unit file (for an install older than install.sh: the old unit shape,
+# with the keep-workloads drop-in when production has it), its own port and directory, and dummy workloads
+# started through the old connector.
 # The new build is /opt/ssh-mcp/server.new.ts (LIVE=... for another install path). The live ssh-mcp.service and its processes are never touched.
 #   R  failed deploy from the current state   -> must roll back file (and unit), workloads alive
 #   A  good deploy                            -> the new tool list, same command environment, workloads alive
@@ -14,7 +15,11 @@ R=/tmp/ssh-mcp-rehearsal; SVC=ssh-mcp-rehearsal; PORT=8789
 UNITF=/etc/systemd/system/$SVC.service; DROPIN=$UNITF.d/10-keep-workloads.conf
 CG=/sys/fs/cgroup/system.slice/$SVC.service
 LIVE=${LIVE:-/opt/ssh-mcp}                 # the live install this rehearsal copies from
-PRODFIX=/etc/systemd/system/ssh-mcp.service.d/10-keep-workloads.conf
+LIVEUNIT=/etc/systemd/system/ssh-mcp.service
+PRODFIX=$LIVEUNIT.d/10-keep-workloads.conf
+# A unit made by install.sh already keeps workloads alive (KillMode=process is in the unit itself), so the deploy
+# has no unit to fix; an older one gets the fix (UNITFIX=1), as its first real deploy would.
+if grep -qs '^KillMode=process' $LIVEUNIT; then FIX=0; else FIX=1; fi
 TO=$(sed -n 's/^EXPECT=\${EXPECT:-"\(.*\)"}$/\1/p' $LIVE/upgrade/deploy.sh | wc -w)     # tools the new build must have
 PATS=('sleep 8001' 'sleep 8002' 'while :; do sleep 0.4' 'sleep 8003')
 part=${1:-all}
@@ -68,7 +73,13 @@ if [ "$part" = all ] || [ "$part" = setup ]; then
   echo '{ "local": { "local": true } }' > $R/hosts.json
   echo "MCP_SECRET=$(openssl rand -hex 32)" > $R/env; chmod 600 $R/env             # throwaway secret
   printf 'import time\nb = []\nfor i in range(400):\n    b.append(b"x" * (8 << 20))\n    time.sleep(0.01)\nprint("allocated", len(b) * 8, "MB")\n' > $R/hog.py
-  cat > $UNITF <<EOF
+  if [ "$FIX" = 0 ]; then    # the live unit itself, pointed at the rehearsal's folder, port, secret and state
+    LIVEAPP=$(sed -n 's/^WorkingDirectory=//p' $LIVEUNIT | head -1)
+    sed -e "s#${LIVEAPP:-/opt/ssh-mcp}#$R#g" -e "s#^Description=.*#Description=ssh-mcp connector (rehearsal copy - safe to delete)#" \
+        -e "s#^EnvironmentFile=.*#EnvironmentFile=$R/env#" -e "s#^Environment=PORT=.*#Environment=PORT=$PORT#" \
+        -e "s#^Environment=JOBS_DIR=.*#Environment=JOBS_DIR=$R/jobs#" $LIVEUNIT > $UNITF
+  else
+    cat > $UNITF <<EOF
 [Unit]
 Description=ssh-mcp connector (rehearsal copy - safe to delete)
 After=network.target
@@ -82,7 +93,8 @@ ExecStart=/usr/local/bin/npx tsx server.ts
 Restart=always
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 EOF
-  if [ -e $PRODFIX ]; then mkdir -p $UNITF.d; sed "s#$LIVE#$R#g" $PRODFIX > $DROPIN; fi      # same unit fix as production
+    if [ -e $PRODFIX ]; then mkdir -p $UNITF.d; sed "s#$LIVE#$R#g" $PRODFIX > $DROPIN; fi      # same unit fix as production
+  fi
   systemctl daemon-reload; systemctl start $SVC
 fi
 . $R/env
@@ -104,22 +116,22 @@ fi
 
 FROM=$(cat $R/from 2>/dev/null)
 if [ "$part" = all ] || [ "$part" = R ]; then
-  echo; echo "== R. failed deploy from the current state (a build that crashes at startup, UNITFIX=1)"
+  echo; echo "== R. failed deploy from the current state (a build that crashes at startup, UNITFIX=$FIX)"
   printf 'throw new Error("rehearsal: broken build");\n' > $R/server.new.ts
-  deploy r 1
+  deploy r $FIX
   echo "   expect: $FROM tools again, unit exactly as at setup, 4/4 alive"; unit; workloads
 fi
 
 if [ "$part" = all ] || [ "$part" = A ]; then
-  echo; echo "== A. good deploy of the new build (UNITFIX=1)"
+  echo; echo "== A. good deploy of the new build (UNITFIX=$FIX)"
   cp $R/server.good.ts $R/server.new.ts
-  deploy a 1
-  echo "   expect: $TO tools, KillMode=process, OOMPolicy=continue, drop-in present, node start, 4/4 alive"; unit; workloads
+  deploy a $FIX
+  echo "   expect: $TO tools, KillMode=process, OOMPolicy=continue, $([ $FIX = 1 ] && echo "drop-in present" || echo "no drop-in needed"), node start, 4/4 alive"; unit; workloads
   echo "   a batch through the new build:"; call batch "{\"host\":\"local\",\"cwd\":\"$R\",\"ops\":[{\"write\":{\"file_path\":\"$R/b.txt\",\"content\":\"one\\n\"}},{\"edit\":{\"file_path\":\"$R/b.txt\",\"old_string\":\"one\",\"new_string\":\"two\"}},{\"bash\":{\"command\":\"cat b.txt; false\"}},{\"bash\":{\"command\":\"echo never\"}}]}" | grep '^===' | sed 's/^/      /'
   envsnap > $R/log/env-after.txt
   if diff $R/log/env-before.txt $R/log/env-after.txt >/dev/null; then echo "   command environment before/after: IDENTICAL"; sed 's/^/      /' $R/log/env-after.txt
   else echo "   command environment CHANGED:"; diff $R/log/env-before.txt $R/log/env-after.txt | sed 's/^/      /'; fi
-  echo "   drop-in:"; grep -v '^#' $DROPIN | sed 's/^/      /'
+  [ -e $DROPIN ] && { echo "   drop-in:"; grep -v '^#' $DROPIN | sed 's/^/      /'; }
 fi
 
 if [ "$part" = all ] || [ "$part" = S ]; then
@@ -144,8 +156,8 @@ fi
 if [ "$part" = all ] || [ "$part" = B ]; then
   echo; echo "== B. failed deploy on top of the new build"
   printf 'throw new Error("rehearsal: broken build");\n' > $R/server.new.ts
-  deploy b 1
-  echo "   expect: $TO tools (the good new build is back), drop-in still present, 4/4 alive"; unit; workloads
+  deploy b $FIX
+  echo "   expect: $TO tools (the good new build is back), unit as after A, 4/4 alive"; unit; workloads
 fi
 
 if [ "$part" = all ] || [ "$part" = cleanup ]; then
