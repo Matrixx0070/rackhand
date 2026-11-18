@@ -13,13 +13,13 @@
 #      into its own scope first (with OOMPolicy=continue).
 #   3. Swap server.new.ts into place, stop, make sure the old listener is gone, start.
 #   4. Roll back automatically (file and drop-in) unless tools/list answers with the expected tools and,
-#      when the new server has them, a two-step batch call runs and a bridge URL serves the box client
-#      and runs a command.
+#      when the new server has them, the audit log is being written, a two-step batch call runs and a
+#      bridge URL serves the box client and runs a command.
 # Env overrides (SVC PORT APP ENVF LOGDIR) exist so the whole script can be rehearsed on a throwaway copy.
 set -u
 SVC=${SVC:-ssh-mcp}; PORT=${PORT:-8787}; APP=${APP:-/opt/ssh-mcp}; ENVF=${ENVF:-/etc/ssh-mcp.env}
 LOGDIR=${LOGDIR:-/opt/ssh-mcp/upgrade}; UNITFIX=${UNITFIX:-0}
-EXPECT=${EXPECT:-"bash batch bridge edit exec_code list_hosts read sftp_list sftp_read sftp_write ssh_exec ssh_exec_many ssh_job ssh_jobs ssh_spawn write"}
+EXPECT=${EXPECT:-"audit bash batch bridge edit exec_code list_hosts read sftp_list sftp_read sftp_write ssh_exec ssh_exec_many ssh_job ssh_jobs ssh_spawn write"}
 NODE=${NODE:-/usr/local/bin/node}
 DROPDIR=/etc/systemd/system/$SVC.service.d; DROPIN=$DROPDIR/10-keep-workloads.conf
 cd "$APP"
@@ -51,8 +51,16 @@ tools() {
 listener() { ss -ltnpH "sport = :$PORT" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2; }
 killmode() { systemctl show -p KillMode --value "$SVC"; }
 incg() { grep -qs "/$SVC.service\$" "/proc/$1/cgroup"; }      # is this pid (still) a process of our unit?
-smoke() {   # real calls against the new server: a batch, then the bridge end to end
+smoke() {   # real calls against the new server: the audit log, a batch, then the bridge end to end
   local b cli out
+  case " $EXPECT " in *" audit "*)
+    out=$(curl -s -m 20 -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+          -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"audit","arguments":{"limit":1}}}' "$U" 2>/dev/null)
+    case "$out" in *"WARNING: the last write"*|*"not being written"*) say "smoke: the audit log is not being written: $(echo "$out" | tail -c 200 | tr '\n' ' ')"; return 1;;
+      *"audit log: /"*) say "smoke: audit log ok ($(echo "$out" | grep -o 'audit log: /[^ ]*' | head -1 | cut -d' ' -f3))";;
+      *"turned off"*) say "smoke: audit log is turned off (AUDIT_LOG=off)";;
+      *) say "smoke: audit call failed: $(echo "$out" | tail -c 200 | tr '\n' ' ')"; return 1;; esac;;
+  esac
   case " $EXPECT " in *" batch "*)
     out=$(curl -s -m 20 -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
           -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"batch","arguments":{"host":"local","ops":[{"bash":{"command":"echo smoke-a"}},{"bash":{"command":"echo smoke-b"}}]}}}' "$U" 2>/dev/null)

@@ -20,11 +20,13 @@
 #   NO_CADDY=1               do not install or configure Caddy (bring your own HTTPS reverse proxy)
 #   REPO=owner/name REF=main where to download the code from
 #   SRC=/path/to/checkout    install from a local directory instead of downloading
-#   APP=/opt/ssh-mcp SVC=ssh-mcp PORT=8787 ENVF=/etc/ssh-mcp.env    install somewhere else / under another name
+#   APP=/opt/ssh-mcp SVC=ssh-mcp PORT=8787 ENVF=/etc/ssh-mcp.env STATE=/var/lib/ssh-mcp
+#                            install somewhere else / under another name (each install needs its own STATE)
 set -euo pipefail
 
 REPO=${REPO:-Matrixx0070/ssh-mcp}; REF=${REF:-main}; SRC=${SRC:-}
 APP=${APP:-/opt/ssh-mcp}; SVC=${SVC:-ssh-mcp}; PORT=${PORT:-8787}; ENVF=${ENVF:-/etc/$SVC.env}
+STATE=${STATE:-/var/lib/$SVC}   # job logs, sessions, saved output and the audit log
 NO_CADDY=${NO_CADDY:-0}; DOMAIN=${DOMAIN:-}; PUBLIC_IP=${PUBLIC_IP:-}
 CADDYFILE=/etc/caddy/Caddyfile
 UNIT=/etc/systemd/system/$SVC.service
@@ -97,6 +99,7 @@ MCP_SECRET=$(sed -n 's/^MCP_SECRET=//p' "$ENVF" | head -1)
 # KillMode=process + OOMPolicy=continue: restarting, crashing or an out-of-memory kill of the connector
 # does not take down the programs that were started through it.
 RUN_HOME=$(getent passwd 0 | cut -d: -f6); RUN_HOME=${RUN_HOME:-/root}
+install -d -m 700 "$STATE"      # private: it holds command output and the audit log
 cat > "$UNIT" <<EOF
 [Unit]
 Description=ssh-mcp connector (remote MCP server)
@@ -107,6 +110,7 @@ WorkingDirectory=$APP
 EnvironmentFile=$ENVF
 Environment=HOSTS_FILE=$APP/hosts.json
 Environment=PORT=$PORT
+Environment=JOBS_DIR=$STATE/jobs
 Environment="HOME=$RUN_HOME"
 Environment="PATH=$APP/node_modules/.bin:$(dirname "$NODE"):/usr/local/bin:/usr/bin:/bin"
 ExecStart=$NODE --import tsx server.ts
@@ -227,6 +231,8 @@ echo "=================================================================="
 echo " Add it as a custom connector / remote MCP server in your AI client (see README)."
 echo " More SSH hosts:  edit $APP/hosts.json (example: $APP/hosts.example.json)"
 echo " Logs:            journalctl -u $SVC -f"
+AUDIT=$(journalctl -u "$SVC" -n 50 --no-pager -o cat 2>/dev/null | sed -n 's/^audit log: //p' | tail -1 || true)
+[ -n "$AUDIT" ] && echo " Audit log:       $AUDIT   (every call the connector runs)"
 echo " New secret:      delete $ENVF, run this installer again, re-add the connector"
 if [ -n "$ROLE" ]; then
   echo

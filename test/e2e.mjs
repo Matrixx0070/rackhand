@@ -6,7 +6,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { appendFileSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, existsSync, statSync, lstatSync, chmodSync,
+import { appendFileSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, renameSync, existsSync, statSync, lstatSync, chmodSync,
   openSync, readSync, writeSync, fstatSync, fchmodSync, closeSync } from "node:fs";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -33,6 +33,7 @@ const BASE2 = `http://127.0.0.1:${PORT2}/mcp/${SECRET}`;
 const OLD = ["list_hosts", "ssh_exec", "sftp_read", "sftp_write", "sftp_list", "ssh_exec_many", "ssh_spawn", "ssh_job", "ssh_jobs", "exec_code"]; // v1.0 + v1.1, as deployed
 const NEW = ["bash", "read", "write", "edit", "bridge"]; // v1.2
 const V13 = ["batch"]; // v1.3
+const V14 = ["audit"]; // v1.4
 const HOSTS = ["local", "remote"];
 const MAX_OUT = 100_000;
 const SERVER_LOG = path.join(tmpdir(), `ssh-mcp-e2e-server-${process.getuid?.() ?? 0}.log`); // stdout+stderr of the servers under test (one per user)
@@ -214,9 +215,9 @@ test("R7 ssh_exec keeps MAX_OUT truncation", async () => {
 
 // ───────────────────────── New tools ─────────────────────────
 
-test("N1 tools/list exposes exactly the 16 tools", async () => {
+test("N1 tools/list exposes exactly the 17 tools", async () => {
   const { json } = await rpc(BASE, "tools/list");
-  assert.deepEqual(json.result.tools.map((t) => t.name).sort(), [...OLD, ...NEW, ...V13].sort());
+  assert.deepEqual(json.result.tools.map((t) => t.name).sort(), [...OLD, ...NEW, ...V13, ...V14].sort());
 });
 
 const splitBlocks = (text) => text.split(/\n\n(?==== \[)/).map((b) => {
@@ -741,7 +742,7 @@ test("G1 bridge tool mints a time-limited URL for sandbox shells", async () => {
 
 test("G2 bridge auth: only a valid, unexpired token opens /b/<token>/...", async () => {
   const good = `http://127.0.0.1:${PORT}/b/${signTok(now() + 600)}`;
-  assert.equal((await rpc(`${good}/mcp`, "tools/list")).json.result.tools.length, 16);
+  assert.equal((await rpc(`${good}/mcp`, "tools/list")).json.result.tools.length, 17);
   assert.equal((await call("ssh_exec", { host: "local", command: "echo via-bridge" }, `${good}/mcp`)).text, "exit: 0\n--- stdout ---\nvia-bridge\n\n--- stderr ---\n");
   const expired = `http://127.0.0.1:${PORT}/b/${signTok(now() - 5)}`;
   const forged = `http://127.0.0.1:${PORT}/b/${(now() + 600).toString(36)}.${"0".repeat(32)}`;
@@ -831,7 +832,7 @@ test("G6 box CLI served by the connector: tools, exec, put/get, push/pull, call 
     pr.child.stdin.end(input);
     return (await pr).stdout;
   };
-  assert.deepEqual((await box(["tools"])).trim().split(/\s+/).sort(), [...OLD, ...NEW, ...V13].sort());
+  assert.deepEqual((await box(["tools"])).trim().split(/\s+/).sort(), [...OLD, ...NEW, ...V13, ...V14].sort());
   assert.equal(await box(["exec", "--", "echo hi; echo e >&2"]), "hi\ne\n");
   assert.equal(await box(["exec", "-C", TMP, "remote", "--", "pwd"]), TMP + "\n");
   assert.equal(await box(["exec", "--", "-"], {}, "cd /tmp\npwd\nexit 4\n").catch((e) => `${e.code}:${e.stdout}`), "4:/tmp\n"); // script from stdin
@@ -954,12 +955,12 @@ test("V1 the five v1.2 tools are unchanged (bash only gained the optional `quiet
   }
 });
 
-test("I1 initialize: version 1.3.0 and short instructions that point every model at batch / bulk calls", async () => {
+test("I1 initialize: current version and short instructions that point every model at batch / bulk calls", async () => {
   const { json } = await rpc(BASE, "initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "e2e", version: "1" } });
-  assert.equal(json.result.serverInfo.version, "1.3.0");
+  assert.equal(json.result.serverInfo.version, "1.4.0");
   const ins = json.result.instructions;
   assert.equal(typeof ins, "string");
-  for (const word of ["batch", "files", "ssh_exec_many", "quiet", "run_in_background"]) assert.ok(ins.includes(word), `instructions do not mention ${word}`);
+  for (const word of ["batch", "files", "ssh_exec_many", "quiet", "run_in_background", "audit"]) assert.ok(ins.includes(word), `instructions do not mention ${word}`);
   assert.ok(ins.length < 1500, `instructions are ${ins.length} chars`);
 });
 
@@ -1139,4 +1140,306 @@ test("B5 batch validation: each op is exactly one of bash/read/write/edit; nothi
   assert.equal((await call("batch", { host: "local", ops: Array.from({ length: 31 }, () => w) })).isError, true);
   assert.equal((await call("batch", { host: "local", ops: [w, { bash: { command: "" } }] })).isError, true);
   assert.equal(existsSync(f), false, "a malformed batch must not run its first ops");
+});
+
+// ═════════════════════════ v1.4: audit log - every call on record, before it runs ═════════════════════════
+
+const AUDIT_FILE = P("audit", "audit.jsonl");
+const auditLines = (file = AUDIT_FILE) => (existsSync(file) ? readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
+// One merged entry per call: its start record plus (when it finished) its result record. Server events are passed through.
+function auditEntries(file = AUDIT_FILE) {
+  const byId = new Map(), out = [];
+  for (const r of auditLines(file)) {
+    if (r.event) { out.push(r); continue; }
+    if (r.tool) { const e = { ...r, done: false }; byId.set(r.id, e); out.push(e); continue; }
+    const e = byId.get(r.id);
+    assert.ok(e, `a result record without a start record: ${JSON.stringify(r)}`);
+    Object.assign(e, { ...r, t: e.t, done: true });
+  }
+  return out;
+}
+// Streaming bridge routes write their result record after the response has ended, so wait for it.
+async function auditWhen(pick, ready, file = AUDIT_FILE) {
+  let got = [];
+  for (let i = 0; i < 60; i++) { got = pick(auditEntries(file)); if (ready(got)) return got; await sleep(50); }
+  return got;
+}
+const hex = () => randomBytes(4).toString("hex");
+
+for (const host of HOSTS) {
+  test(`A1 audit ${host}: every command is on record - who, what, exit code, duration`, async () => {
+    const mark = `a1-${host}-${hex()}`, t0 = Date.now();
+    await call("bash", { host, command: `echo ${mark}` });
+    await call("bash", { host, command: `echo ${mark}; exit 3`, cwd: TMP });
+    await call("bash", { host, command: `echo ${mark}; sleep 20`, timeout: 1000 });
+    await call("ssh_exec", { host, command: `echo ${mark}; exit 5` });
+    const es = auditEntries().filter((e) => e.what?.includes(mark));
+    assert.deepEqual(es.map((e) => [e.tool, e.host, e.ok, e.exit, e.done]),
+      [["bash", host, true, 0, true], ["bash", host, false, 3, true], ["bash", host, false, 124, true], ["ssh_exec", host, false, 5, true]]);
+    const e = es[0];
+    assert.equal(e.what, `echo ${mark}`);
+    assert.equal(e.via, "mcp");
+    assert.equal(e.ip, "127.0.0.1");
+    assert.match(e.id, /^[0-9a-f]{8}$/);
+    assert.ok(Date.parse(e.t) >= t0 - 1000 && Date.parse(e.t) <= Date.now(), e.t);
+    assert.ok(Number.isInteger(e.ms) && e.ms >= 0 && e.ms < 20_000, String(e.ms));
+    assert.equal(es[1].cwd, TMP);
+    assert.ok(es[2].ms >= 900, "the duration of the timed-out command is recorded");
+  });
+
+  test(`A2 audit ${host}: file tools record paths and sizes - never the content`, async () => {
+    const d = P(`audit-files-${host}`), secret = `TOP-SECRET-CONTENT-${host}`;
+    await call("write", { host, files: [{ file_path: `${d}/a.txt`, content: `${secret}\nline2\n` }, { file_path: `${d}/b.txt`, content: "x" }] });
+    await call("edit", { host, file_path: `${d}/a.txt`, old_string: "line2", new_string: `${secret}-NEW` });
+    await call("read", { host, files: [{ file_path: `${d}/a.txt` }, { file_path: `${d}/b.txt` }] });
+    await call("sftp_write", { host, path: `${d}/c.bin`, content: Buffer.from(secret).toString("base64"), encoding: "base64" });
+    await call("sftp_read", { host, path: `${d}/c.bin` });
+    await call("read", { host, file_path: `${d}/missing.txt` });
+    const es = auditEntries().filter((e) => e.what?.includes(d));
+    assert.deepEqual(es.map((e) => [e.tool, e.ok, e.done]), [["write", true, true], ["edit", true, true], ["read", true, true], ["sftp_write", true, true], ["sftp_read", true, true], ["read", false, true]]);
+    assert.equal(es[0].what, `${d}/a.txt (${secret.length + 7} B), ${d}/b.txt (1 B)`);
+    assert.equal(es[0].bytes, secret.length + 8);
+    assert.equal(es[1].what, `${d}/a.txt (1 edit)`);
+    assert.equal(es[2].what, `${d}/a.txt, ${d}/b.txt`);
+    assert.equal(es[3].what, `${d}/c.bin (${secret.length} B)`);
+    assert.equal(es[4].what, `${d}/c.bin`);
+    assert.match(es[5].err, /File does not exist/);
+    assert.ok(!readFileSync(AUDIT_FILE, "utf8").includes("TOP-SECRET-CONTENT"), "file content must never reach the audit log");
+  });
+
+  test(`A4 audit ${host}: each step of a batch has its own record, linked to the batch; skipped steps have none`, async () => {
+    const d = P(`audit-batch-${host}`);
+    await call("batch", { host, ops: [
+      { write: { file_path: `${d}/a.txt`, content: "one\n" } },
+      { bash: { command: `cat ${d}/a.txt; exit 2` } },
+      { bash: { command: `echo never-ran-${host}` } },
+    ] });
+    const es = auditEntries();
+    const b = es.filter((e) => e.tool === "batch" && e.host === host).at(-1);
+    assert.deepEqual([b.what, b.ok, b.ops, b.done, b.err], ["3 ops", false, "1 ok, 1 failed, 1 skipped", true, "1 of 3 ops failed"]);
+    const ops = es.filter((e) => e.batch?.startsWith(`${b.id}#`));
+    assert.deepEqual(ops.map((e) => [e.batch, e.tool, e.host, e.ok, e.exit ?? null, e.done]),
+      [[`${b.id}#1/3`, "write", host, true, null, true], [`${b.id}#2/3`, "bash", host, false, 2, true]]);
+    assert.equal(ops[0].what, `${d}/a.txt (4 B)`);
+    assert.equal(ops[1].what, `cat ${d}/a.txt; exit 2`);
+    assert.ok(!es.some((e) => e.what?.includes(`never-ran-${host}`)), "a skipped step never ran, so it is not in the log");
+  });
+}
+
+test("A3 audit: passwords, tokens, keys and the connector's own secret are masked before anything is written", async () => {
+  const commands = [
+    `: mysql --password=hunter2secret -u root`,
+    `: export API_TOKEN="tokvalue12345"`,
+    `: curl -H 'Authorization: Bearer abcdefghijklmnop123456' https://example.com`,
+    `: tool --api-key keyvalue98765 --verbose`,
+    `: echo '{"client_secret": "jsonsecretvalue1"}'`,
+    `: curl http://127.0.0.1:${PORT}/mcp/${SECRET}`,
+    `: cat <<'K'\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaGtleXZhbHVl\n-----END OPENSSH PRIVATE KEY-----\nK`,
+  ];
+  for (const command of commands) assert.equal((await call("bash", { host: "local", command })).text, "(no output)", command);
+  await call("exec_code", { host: "local", language: "bash", code: `: PASSWORD=codepassvalue1` });
+  const raw = readFileSync(AUDIT_FILE, "utf8");
+  for (const leaked of ["hunter2secret", "tokvalue12345", "abcdefghijklmnop123456", "keyvalue98765", "jsonsecretvalue1", SECRET, "b3BlbnNzaGtleXZhbHVl", "codepassvalue1"])
+    assert.ok(!raw.includes(leaked), `${leaked.slice(0, 12)}... leaked into the audit log`);
+  const whats = auditEntries().map((e) => e.what ?? "");
+  assert.ok(whats.includes(": mysql --password=*** -u root"), "the rest of the command stays readable");
+  assert.ok(whats.includes(": tool --api-key *** --verbose"));
+  assert.ok(whats.some((w) => w.includes("Authorization: ") && w.endsWith(" https://example.com")));
+  assert.ok(whats.includes(`: curl http://127.0.0.1:${PORT}/mcp/[connector secret]`));
+  assert.ok(whats.includes("bash: : PASSWORD=***"));
+});
+
+test("A5 audit: bridge requests are on record too, tied to the bridge URL they came through - never the token itself", async () => {
+  const mint = await call("bridge", { ttl_hours: 1 });
+  const [, url, exp, sig] = mint.text.match(/(http:\/\/\S+\/b\/([0-9a-z]+)\.([0-9a-f]{32}))/);
+  const d = P("audit-bridge"), octet = { "Content-Type": "application/octet-stream" };
+  mkdirSync(d);
+  await (await fetch(`${url}/exec/local?c64=${p64(TMP)}`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: "echo audit-bridge-exec; exit 6" })).text();
+  await (await fetch(`${url}/fs/local?p64=${p64(`${d}/up.bin`)}`, { method: "PUT", headers: octet, body: "12345" })).text();
+  await (await fetch(`${url}/fs/local?p64=${p64(`${d}/up.bin`)}`)).arrayBuffer();
+  const tgz = Buffer.from(await (await fetch(`${url}/tar/local?p64=${p64(d)}&x=skip-me`)).arrayBuffer());
+  await (await fetch(`${url}/tar/local?p64=${p64(`${d}/copy`)}`, { method: "PUT", headers: octet, body: tgz })).text();
+  await call("bash", { host: "local", command: "echo audit-bridge-mcp" }, `${url}/mcp`);
+  await (await fetch(`${url}/cli`)).text();
+  await (await fetch(`${url}/fs/local?p64=${p64(`${d}/missing.bin`)}`)).text();
+  const es = await auditWhen((all) => all.filter((e) => e.tok === exp), (list) => list.length === 9 && list.every((e) => e.done));
+  assert.deepEqual(es.map((e) => [e.tool, e.via, e.ok, e.done]), [
+    ["bridge", "mcp", true, true], ["bridge.exec", "bridge", false, true], ["bridge.put", "bridge", true, true], ["bridge.get", "bridge", true, true],
+    ["bridge.pull", "bridge", true, true], ["bridge.push", "bridge", true, true], ["bash", "bridge", true, true], ["bridge.cli", "bridge", true, true], ["bridge.get", "bridge", false, true]]);
+  assert.deepEqual([es[1].what, es[1].exit, es[1].cwd, es[1].host], ["echo audit-bridge-exec; exit 6", 6, TMP, "local"]);
+  assert.deepEqual([es[2].what, es[2].bytes], [`${d}/up.bin (5 B)`, 5]);
+  assert.deepEqual([es[3].what, es[3].bytes], [`${d}/up.bin`, 5]);
+  assert.equal(es[4].what, `${d} (exclude: skip-me)`);
+  assert.equal(es[5].what, `${d}/copy`);
+  assert.equal(es[6].what, "echo audit-bridge-mcp");
+  assert.match(es[8].err, /no such readable file/i);
+  assert.ok(!readFileSync(AUDIT_FILE, "utf8").includes(sig), "the signature half of a bridge token must never be logged");
+});
+
+test("A6 audit: the client address is the one the reverse proxy saw (right-most X-Forwarded-For), with the user agent", async () => {
+  const send = (command, headers) => fetch(BASE, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...headers },
+    body: JSON.stringify({ jsonrpc: "2.0", id: nextId++, method: "tools/call", params: { name: "bash", arguments: { host: "local", command } } }),
+  }).then((r) => r.text());
+  await send("echo a6-proxied", { "X-Forwarded-For": "6.6.6.6, 198.51.100.7", "User-Agent": "Claude-User-Test/1.0" });
+  await send("echo a6-direct", { "User-Agent": "x".repeat(500) });
+  await send("echo a6-garbage", { "X-Forwarded-For": "not an address <script>" });
+  const pick = (what) => auditEntries().filter((e) => e.what === what).at(-1);
+  assert.deepEqual([pick("echo a6-proxied").ip, pick("echo a6-proxied").ua], ["198.51.100.7", "Claude-User-Test/1.0"]);
+  assert.equal(pick("echo a6-direct").ip, "127.0.0.1");
+  assert.equal(pick("echo a6-direct").ua.length, 120);
+  assert.equal(pick("echo a6-garbage").ip, "?");
+});
+
+test("A7 audit: a command is recorded BEFORE it runs, so one that kills the connector is still in the log; every start is recorded", async () => {
+  const jobs = P("a7", "jobs"), file = P("a7", "audit", "audit.jsonl"), port = 18790, base = `http://127.0.0.1:${port}/mcp/${SECRET}`;
+  const p = await startServer(port, { JOBS_DIR: jobs });
+  assert.deepEqual(auditLines(file).map((r) => [r.event, r.pid, r.version]), [["start", p.pid, "1.4.0"]]);
+  const gone = new Promise((res) => p.once("exit", res));
+  await assert.rejects(call("bash", { host: "local", command: `kill -9 ${p.pid} # a7-killer` }, base));
+  await gone;
+  const e = auditEntries(file).find((x) => x.what?.includes("a7-killer"));
+  assert.ok(e, "the command that killed the server is in the log");
+  assert.equal(e.done, false);
+  // a new server on the same state directory carries on in the same file and shows the call that never returned
+  await startServer(port, { JOBS_DIR: jobs });
+  const shown = (await call("audit", { contains: "a7-killer" }, base)).text;
+  assert.match(shown, new RegExp(`  bash  local  no result \\(still running, or the server stopped\\)  -  kill -9 ${p.pid} # a7-killer$`, "m"));
+  assert.equal(auditLines(file).filter((r) => r.event === "start").length, 2);
+  assert.match((await call("audit", { contains: "server started" }, base)).text, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ  server started: v1\.4\.0, pid \d+$/m);
+});
+
+test("A8 audit: the log rotates at its size limit and keeps a fixed number of old files", async () => {
+  const dir = P("a8", "audit"), port = 18791, base = `http://127.0.0.1:${port}/mcp/${SECRET}`, limit = Math.round(0.004 * 1024 * 1024);
+  await startServer(port, { JOBS_DIR: P("a8", "jobs"), AUDIT_MAX_MB: "0.004", AUDIT_KEEP: "2" });
+  for (let i = 0; i < 60; i++) await call("ssh_exec", { host: "local", command: `: ${"x".repeat(300)} a8-n${i}` }, base);
+  const files = readdirSync(dir).sort();
+  assert.deepEqual(files, ["audit.jsonl", "audit.jsonl.1", "audit.jsonl.2"]);
+  for (const f of files) assert.ok(statSync(path.join(dir, f)).size <= limit, `${f} is ${statSync(path.join(dir, f)).size} bytes`);
+  // oldest file first: every line is whole JSON and the calls are in order, ending with the last one made
+  const seq = ["audit.jsonl.2", "audit.jsonl.1", "audit.jsonl"].flatMap((f) => auditLines(path.join(dir, f))).filter((r) => r.what).map((r) => Number(r.what.match(/a8-n(\d+)$/)[1]));
+  assert.ok(seq.length >= 10 && seq.length < 60, `kept ${seq.length} calls`);
+  assert.deepEqual(seq, Array.from({ length: seq.length }, (_, k) => 60 - seq.length + k));
+});
+
+test("A9 audit tool: the newest entries, filtered by text and by age; its own calls are on record too", async () => {
+  const mark = `a9-${hex()}`, line = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ  127\.0\.0\.1  mcp  /;
+  for (const n of [1, 2, 3]) await call("bash", { host: "local", command: `echo ${mark}-${n}; exit ${n - 1}` });
+  const all = (await call("audit", { contains: mark })).text.split("\n");
+  assert.match(all[0], /^audit log: .*\/audit\.jsonl - 3 of 3 matching entries, oldest first$/);
+  assert.equal(all.length, 4);
+  for (const l of all.slice(1)) assert.match(l, line);
+  assert.match(all[1], new RegExp(`  bash  local  ok  \\d+\\.\\d\\ds  echo ${mark}-1; exit 0$`));
+  assert.match(all[2], new RegExp(`  bash  local  exit 1  \\d+\\.\\d\\ds  echo ${mark}-2; exit 1$`));
+  assert.match(all[3], new RegExp(`  bash  local  exit 2  \\d+\\.\\d\\ds  echo ${mark}-3; exit 2$`));
+  // the query above is itself an entry now, and a query never lists itself while it runs
+  const two = (await call("audit", { contains: mark, limit: 2 })).text.split("\n");
+  assert.match(two[0], / - 2 of 4 matching entries, oldest first$/);
+  assert.match(two[1], new RegExp(`echo ${mark}-3; exit 2$`));
+  assert.match(two[2], new RegExp(`  audit  -  ok  \\d+\\.\\d\\ds  contains="${mark}"$`));
+  // age filter: an old entry is found without it and left out with it
+  appendFileSync(AUDIT_FILE, `{"t":"2020-01-01T00:00:00.000Z","id":"0ld0ld00","via":"mcp","ip":"10.9.9.9","tool":"bash","host":"local","what":"echo ${mark}-old"}\n{"t":"2020-01-01T00:00:01.000Z","id":"0ld0ld00","ok":true,"exit":0,"ms":1000}\n`);
+  assert.match((await call("audit", { contains: `${mark}-old` })).text, new RegExp(`^2020-01-01T00:00:00Z  10\\.9\\.9\\.9  mcp  bash  local  ok  1\\.00s  echo ${mark}-old$`, "m"));
+  assert.doesNotMatch((await call("audit", { contains: `${mark}-old`, since_minutes: 60 })).text, /2020-01-01/);
+  assert.match((await call("audit", { contains: "NO-SUCH-TEXT-ANYWHERE-zz" })).text, / - no matching entries$/);
+  assert.equal((await call("audit", { limit: 0 })).isError, true);
+  // multi-line commands stay on one line
+  await call("bash", { host: "local", command: `: ${mark}-multi\n: second line` });
+  assert.match((await call("audit", { contains: `${mark}-multi` })).text, new RegExp(`  : ${mark}-multi ⏎ : second line$`, "m"));
+});
+
+test("A10 audit: the log is private to the service user (0700 / 0600) and follows the state directory when the default is not writable", async () => {
+  assert.equal(statSync(P("audit")).mode & 0o777, 0o700);
+  assert.equal(statSync(AUDIT_FILE).mode & 0o777, 0o600);
+  await call("list_hosts", {}, BASE2);            // this server has JOBS_DIR=/proc/nope/jobs and HOME=HOME2
+  const fallback = path.join(HOME2, ".ssh-mcp", "audit", "audit.jsonl");
+  assert.ok(auditEntries(fallback).some((e) => e.tool === "list_hosts" && e.done && e.ok), "calls are logged under ~/.ssh-mcp/audit");
+  assert.equal(statSync(fallback).mode & 0o777, 0o600);
+});
+
+test("A11 AUDIT_LOG=off: nothing is written, the tools work, and the audit tool says so", async () => {
+  const port = 18792, base = `http://127.0.0.1:${port}/mcp/${SECRET}`;
+  await startServer(port, { JOBS_DIR: P("a11", "jobs"), AUDIT_LOG: "off" });
+  assert.equal((await call("bash", { host: "local", command: "echo a11" }, base)).text, "a11\n");
+  const b = await call("batch", { host: "local", ops: [{ bash: { command: "echo a11-batch" } }] }, base);
+  assert.match(b.text, /a11-batch\n=== batch: 1 ok, 0 failed, 0 skipped/);
+  assert.equal(existsSync(P("a11", "audit")), false);
+  assert.match((await call("audit", {}, base)).text, /turned off/);
+});
+
+test("A12 audit: tools can only be registered through the audited wrapper", () => {
+  const src = readFileSync(path.join(ROOT, SERVER_FILE), "utf8");
+  assert.equal((src.match(/server\.registerTool\b/g) ?? []).length, 1, "server.registerTool must appear once: inside the wrapper that writes the audit record");
+});
+
+test("A13 audit: every one of the tools leaves a record", async () => {
+  const f = P("a13.txt"), from = auditEntries().length;
+  await call("list_hosts", {});
+  await call("ssh_exec", { host: "local", command: "true" });
+  await call("sftp_write", { host: "local", path: f, content: "one\n" });
+  await call("sftp_read", { host: "local", path: f });
+  await call("sftp_list", { host: "local", path: TMP });
+  await call("ssh_exec_many", { host: "local", commands: [{ id: "a", command: "true" }, { id: "b", command: "exit 2" }] });
+  const { jobId } = await spawnJob("local", "echo a13-job");
+  await job("local", jobId, "wait", { timeout_sec: 20 });
+  await call("ssh_jobs", { host: "local", limit: 1 });
+  await call("exec_code", { host: "local", language: "bash", code: "exit 4" });
+  await call("bash", { host: "local", command: "sleep 0.1", run_in_background: true });
+  await call("read", { host: "local", file_path: f });
+  await call("write", { host: "local", file_path: f, content: "two\n" });
+  await call("edit", { host: "local", file_path: f, old_string: "two", new_string: "three" });
+  await call("batch", { host: "local", ops: [{ read: { file_path: f } }] });
+  await call("bridge", {});
+  await call("audit", { limit: 1 });
+  const es = auditEntries().slice(from), names = (await rpc(BASE, "tools/list")).json.result.tools.map((t) => t.name);
+  assert.equal(names.length, 17);
+  for (const n of names) assert.ok(es.some((e) => e.tool === n && e.done), `no audit record for ${n}`);
+  const of = (toolName) => es.find((e) => e.tool === toolName && !e.batch);
+  assert.deepEqual([of("ssh_exec_many").what, of("ssh_exec_many").exits, of("ssh_exec_many").ok], ["a: true\nb: exit 2", [0, 2], false]);
+  assert.deepEqual([of("exec_code").what, of("exec_code").exit, of("exec_code").ok], ["bash: exit 4", 4, false]);
+  assert.deepEqual([of("ssh_spawn").what, of("ssh_spawn").job], ["echo a13-job", jobId]);
+  assert.equal(of("ssh_job").what, `wait ${jobId}`);
+  assert.deepEqual([of("bash").what, of("bash").bg, typeof of("bash").job], ["sleep 0.1", true, "string"]);
+  assert.equal(of("edit").what, `${f} (1 edit)`);
+  assert.equal(of("sftp_list").what, TMP);
+  assert.equal(of("bridge").what, "ttl_hours=12");
+});
+
+test("A14 audit: if the log is removed, cut or replaced, the log itself says so and carries on", async () => {
+  const dir = P("a14", "audit"), file = path.join(dir, "audit.jsonl"), port = 18793, base = `http://127.0.0.1:${port}/mcp/${SECRET}`;
+  await startServer(port, { JOBS_DIR: P("a14", "jobs") });
+  const run = (n) => call("ssh_exec", { host: "local", command: `: a14-${n}` }, base);
+  const shape = () => auditLines(file).map((r) => r.event ? `${r.event}: ${r.why ?? ""}` : r.what ?? "result");
+  await run(1);
+  assert.deepEqual(shape(), ["start: ", ": a14-1", "result"]);
+  rmSync(file);                                                    // removed
+  await run(2);
+  assert.deepEqual(shape(), ["reset: the log file was missing", ": a14-2", "result"]);
+  writeFileSync(file, "");                                         // emptied in place
+  await run(3);
+  assert.deepEqual(shape(), ["reset: the log file got shorter", ": a14-3", "result"]);
+  writeFileSync(`${file}.edited`, readFileSync(file));              // swapped for an edited copy of the same size
+  renameSync(`${file}.edited`, file);
+  await run(4);
+  assert.deepEqual(shape().slice(3), ["reset: the log file was replaced", ": a14-4", "result"]);
+  await run(5);                                                    // untouched since: nothing to report
+  assert.deepEqual(shape().slice(6), [": a14-5", "result"]);
+  rmSync(dir, { recursive: true });                                // the whole directory removed
+  await run(6);
+  assert.deepEqual(shape(), ["reset: the log file was missing", ": a14-6", "result"]);
+  assert.deepEqual([statSync(dir).mode & 0o777, statSync(file).mode & 0o777], [0o700, 0o600]);
+  assert.match((await call("audit", {}, base)).text, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ  audit log reset: the log file was missing$/m);
+});
+
+test("A15 audit: a long command is masked first and cut to 2000 characters afterwards", async () => {
+  const long = `: ${"a".repeat(1975)} password=straddle-secret-value ${"b".repeat(3000)}`;   // the password sits right on the cut
+  assert.equal((await call("bash", { host: "local", command: long })).text, "(no output)");
+  const e = auditEntries().filter((x) => x.what?.startsWith(": aaaaaaaa")).at(-1);
+  assert.equal(e.what.slice(0, 2000), `: ${"a".repeat(1975)} password=***${" ".repeat(1)}${"b".repeat(2000)}`.slice(0, 2000));
+  assert.match(e.what.slice(2000), /^…\[\+\d+ chars\]$/);
+  assert.ok(!readFileSync(AUDIT_FILE, "utf8").includes("straddle"), "no part of a credential on the cut may be kept");
+  const t0 = Date.now();                                           // a hostile 60 KB command must not stall the server
+  assert.equal((await call("bash", { host: "local", command: `: ${"pass".repeat(15000)}` })).isError, false);
+  assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`);
 });

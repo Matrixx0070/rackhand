@@ -8,7 +8,9 @@ import { Client, type ConnectConfig } from "ssh2";
 import { exec, spawn } from "node:child_process";
 import { readFileSync, promises as fs } from "node:fs";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { dirname } from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { PassThrough, Transform, type Readable, type Writable } from "node:stream";
 
 const PORT = Number(process.env.PORT ?? 8787);
@@ -17,7 +19,7 @@ const HOSTS_FILE = process.env.HOSTS_FILE ?? "./hosts.json";
 const MAX_OUT = 100_000;
 const JOBS_DIR = process.env.JOBS_DIR ?? "/var/lib/ssh-mcp/jobs"; // ssh_spawn: <jobId>.log / .exit / .pid / .cmd / .sh
 const MAX_PAYLOAD = 64 * 1024; // bytes of command/code sent inline (base64) in one shell argument
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
 // Sent to the client at initialize; clients put it in front of the model. Keep it short: it costs tokens in every conversation.
 const INSTRUCTIONS = `Remote shell and files on the hosts from list_hosts ("local" = the machine this connector runs on).
 Every tool call is a round trip, so do as much as possible per call:
@@ -26,6 +28,7 @@ Every tool call is a round trip, so do as much as possible per call:
 - ssh_exec_many: up to 10 independent commands at the same time.
 - bash: join steps with && or newlines instead of separate calls; pass quiet: true when only success or failure matters (the full output stays in a file on the host); use run_in_background plus ssh_job (wait) for anything that takes more than a minute.
 - bridge: large, binary or many files, moved directly from a sandbox shell.
+- audit: the log of every call made through this connector, from any chat or client.
 bash starts in the home directory unless cwd or a session is given.`;
 
 if (SECRET.length < 32) throw new Error("Set MCP_SECRET (>=32 random chars)");
@@ -512,10 +515,216 @@ function bridgeTokenOk(token: string): boolean {
   return exp > Date.now() / 1000 && timingSafeEqual(Buffer.from(m[2]), Buffer.from(bridgeSig(exp)));
 }
 
-function buildServer(base = "", viaBridge = false): McpServer {
-  const server = new McpServer({ name: "ssh-connector", version: VERSION }, { instructions: INSTRUCTIONS });
+// ── v1.4: audit log ───────────────────────────────────────────────────────────────────────────────────────────
+// One JSON object per line in <state dir>/audit/audit.jsonl (the state dir is where jobs/, sessions/ and out/
+// live), readable only by the user the server runs as:
+//   {"t","id","via","ip","ua","tool","host","what",...}  written BEFORE the call runs, so a command that takes
+//                                                         the server down with it is still on record
+//   {"t","id","ok","exit","err","ms",...}                the result, written when the call returns
+//   {"t","event":"start","version","pid"}                every start of the server
+// File contents are never logged, only paths and sizes. Commands are logged after masking what looks like a
+// credential: best effort, not a guarantee. The log lives on the machine it describes, so whoever holds the
+// connector URL can also delete it; forward it somewhere else if it has to survive that.
+type Who = { via: "mcp" | "bridge"; ip: string; ua?: string; tok?: string };
+type AuditInfo = { host?: string; what?: string; bytes?: number; cwd?: string; bg?: boolean; batch?: string };
+type AuditEnd = { ok: boolean; err?: string; exit?: number | null; bytes?: number };
+type Args = Record<string, any>; // tool arguments (already validated against the tool's schema) or a parsed log line
 
-  server.registerTool("list_hosts", {
+const envNum = (name: string, dflt: number) => { const v = process.env[name]; const n = v === undefined || v.trim() === "" ? NaN : Number(v); return Number.isFinite(n) ? n : dflt; };
+const AUDIT_OFF = /^(off|0|false|no)$/i.test(process.env.AUDIT_LOG ?? "");
+const AUDIT_MAX = Math.max(1024, Math.round(envNum("AUDIT_MAX_MB", 20) * 1024 * 1024)); // a file never grows past this: it is rotated first
+const AUDIT_KEEP = Math.min(50, Math.max(0, Math.floor(envNum("AUDIT_KEEP", 5))));       // rotated files kept: audit.jsonl.1 (newest) ... .N
+const AUDIT_CLIP = 2000;                                                                 // longest "what" kept per entry
+const AUDIT_TAIL = 4 * 1024 * 1024;                                                      // how much of the end of a file the audit tool searches
+let auditFile = "", auditSize = 0, auditIno = 0, auditErr = "", auditQueue: Promise<void> = Promise.resolve();
+
+const REDACTIONS: [RegExp, string][] = [
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, "[private key]"],
+  [/\b[0-9a-z]{6,12}\.[0-9a-f]{32}\b/g, "[bridge token]"],
+  [/(\bBearer\s+)[A-Za-z0-9._~+\/=-]{8,}/gi, "$1***"],
+  [/(--?(?:pass(?:word|phrase)?|token|secret|api[_-]?key|access[_-]?key)\s+)(?:"[^"]*"|'[^']*'|[^\s-]\S*)/gi, "$1***"],                                                        // --token VALUE
+  [/((?:pass(?:word|wd|phrase)?|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|authorization|credentials?)[\w-]{0,40}["']?\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s&;|'"]+)/gi, "$1***"], // KEY=VALUE, "key": "value"
+];
+const redact = (s: string) => REDACTIONS.reduce((t, [re, to]) => t.replace(re, to), s.split(SECRET).join("[connector secret]"));
+const clip = (s: string, max = AUDIT_CLIP) => (s.length > max ? `${s.slice(0, max)}…[+${s.length - max} chars]` : s);
+// Text for the log: masked first and cut afterwards, so a credential that straddles the cut is not half-kept.
+// Only the first 16 KB are looked at, which bounds the work whatever the size of the command.
+const auditText = (s: string, max = AUDIT_CLIP) => {
+  const head = redact(s.slice(0, 16_384));
+  return head.length > max || s.length > 16_384 ? `${head.slice(0, max)}…[+${Math.max(1, s.length - max)} chars]` : head;
+};
+
+// Who is calling. Behind the reverse proxy the peer is always loopback, and the right-most X-Forwarded-For
+// entry is the address the proxy itself saw (entries further left are whatever the client chose to send).
+function whoOf(req: express.Request): Who {
+  const peer = (req.socket.remoteAddress ?? "").replace(/^::ffff:/, "");
+  const fwd = String(req.headers["x-forwarded-for"] ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+  const ip = (peer === "127.0.0.1" || peer === "::1") && fwd.length ? fwd[fwd.length - 1] : peer;
+  const ua = String(req.headers["user-agent"] ?? "").replace(/[^\x20-\x7e]/g, "").slice(0, 120);
+  const token = (req.params as Record<string, string>).token; // set on /b/:token/... routes
+  return { via: token ? "bridge" : "mcp", ip: /^[0-9A-Fa-f:.]{2,45}$/.test(ip) ? ip : "?", ...(ua ? { ua } : {}), ...(token ? { tok: token.split(".")[0] } : {}) };
+}
+
+async function auditRotate(): Promise<void> {
+  for (let i = AUDIT_KEEP; i >= 1; i--) await fs.rename(i === 1 ? auditFile : `${auditFile}.${i - 1}`, `${auditFile}.${i}`).catch(() => {});
+  if (AUDIT_KEEP === 0) await fs.rm(auditFile, { force: true });
+}
+// Lines are written one at a time, in order. A write that fails is reported once on stderr and never fails the call.
+// If the file was removed, replaced or cut since the last write, the log says so itself before it carries on.
+function auditWrite(rec: Record<string, unknown>): Promise<void> {
+  if (!auditFile) return Promise.resolve();
+  let lines = `${JSON.stringify(rec)}\n`;
+  return (auditQueue = auditQueue.then(async () => {
+    try {
+      let st = await fs.stat(auditFile).catch(() => null);
+      const why = !st ? "the log file was missing" : auditIno && st.ino !== auditIno ? "the log file was replaced" : st.size < auditSize ? "the log file got shorter" : "";
+      if (why) lines = `${JSON.stringify({ t: new Date().toISOString(), event: "reset", why })}\n${lines}`;
+      if (!st) await mkdirp(dirname(auditFile)).then(() => fs.chmod(dirname(auditFile), 0o700)).catch(() => {});
+      const bytes = Buffer.byteLength(lines);
+      if (st && st.size > 0 && st.size + bytes > AUDIT_MAX) { await auditRotate(); st = null; }
+      await fs.appendFile(auditFile, lines, { mode: 0o600 });
+      if (!st || why) { const now = await fs.stat(auditFile); auditIno = now.ino; auditSize = now.size; } else auditSize = st.size + bytes;
+      auditErr = "";
+    } catch (e) {
+      if (!auditErr) console.error(`audit log: cannot write ${auditFile}: ${(e as Error).message}`);
+      auditErr = (e as Error).message;
+    }
+  }));
+}
+async function auditInit(): Promise<void> {
+  if (AUDIT_OFF) return void console.log("audit log: off (AUDIT_LOG)");
+  const dirs = process.env.AUDIT_DIR ? [process.env.AUDIT_DIR] : [join(dirname(JOBS_DIR), "audit"), join(homedir(), ".ssh-mcp", "audit")];
+  for (const dir of dirs) {
+    try {
+      const file = join(dir, "audit.jsonl");
+      await mkdirp(dir);
+      await fs.chmod(dir, 0o700);
+      await (await fs.open(file, "a", 0o600)).close();
+      await fs.chmod(file, 0o600);
+      const st = await fs.stat(file);
+      auditFile = file; auditSize = st.size; auditIno = st.ino; auditErr = "";
+      break;
+    } catch (e) { auditErr = `${dir}: ${(e as Error).message}`; }
+  }
+  if (!auditFile) return void console.error(`audit log: NOT being written (${auditErr})`);
+  console.log(`audit log: ${auditFile}`);
+  await auditWrite({ t: new Date().toISOString(), event: "start", version: VERSION, pid: process.pid });
+}
+
+// The call being audited right now; code deeper down adds facts to its result record with auditNote (exit code, job id).
+const auditScope = new AsyncLocalStorage<{ id: string; notes: Record<string, unknown> }>();
+const auditNote = (fields: Record<string, unknown>) => { const s = auditScope.getStore(); if (s) Object.assign(s.notes, fields); };
+
+// Run one call with an audit record around it: the "what" line first, the result line after.
+async function audited<T>(who: Who, tool: string, info: AuditInfo, run: () => Promise<T>, result: (r: T) => AuditEnd): Promise<T> {
+  if (!auditFile) return run();
+  const id = randomBytes(4).toString("hex"), t0 = Date.now(), scope = { id, notes: {} as Record<string, unknown> };
+  const { what, ...rest } = info;
+  await auditWrite({ t: new Date(t0).toISOString(), id, ...who, tool, ...rest, ...(what ? { what: auditText(what) } : {}) });
+  const end = (e: AuditEnd) => {
+    const fin: Record<string, unknown> = { ...e, ...scope.notes };
+    const codes = Array.isArray(fin.exits) ? fin.exits : fin.exit !== undefined ? [fin.exit] : [];
+    if (codes.some((c) => c !== 0)) fin.ok = false; // a command that ran but did not exit 0 is not "ok"
+    if (typeof fin.err === "string") fin.err = auditText(fin.err, 300);
+    return auditWrite({ t: new Date().toISOString(), id, ...fin, ms: Date.now() - t0 });
+  };
+  try {
+    const r = await auditScope.run(scope, run);
+    await end(result(r));
+    return r;
+  } catch (e) {
+    await end({ ok: false, err: (e as Error).message });
+    throw e;
+  }
+}
+const toolEnd = (out: ToolOut): AuditEnd => {
+  if (!out.isError) return { ok: true };
+  const first = out.content.find((c) => c.type === "text");
+  return { ok: false, err: first?.type === "text" ? first.text.replace(/^Error: /, "") : "error" };
+};
+
+// What a call is about, for the log: the command, or the paths and sizes - never file content.
+function auditInfo(tool: string, a: Args): AuditInfo {
+  const host = typeof a.host === "string" ? a.host : undefined;
+  switch (tool) {
+    case "bash": return { host, what: a.command, ...(a.cwd ? { cwd: a.cwd } : {}), ...(a.run_in_background ? { bg: true } : {}) };
+    case "ssh_exec": case "ssh_spawn": return { host, what: a.command };
+    case "ssh_exec_many": return { host, what: ((a.commands ?? []) as Args[]).map((c) => `${c.id}: ${c.command}`).join("\n") };
+    case "exec_code": return { host, what: `${a.language}: ${a.code}` };
+    case "read": return { host, what: (a.files?.length ? (a.files as Args[]).map((f) => f.file_path) : [a.file_path]).join(", ") };
+    case "write": {
+      const files: Args[] = a.files?.length ? a.files : [{ file_path: a.file_path, content: a.content }];
+      const sizes = files.map((f) => Buffer.byteLength(String(f.content ?? "")));
+      return { host, what: files.map((f, i) => `${f.file_path ?? "?"} (${sizes[i]} B)`).join(", "), bytes: sizes.reduce((x, y) => x + y, 0) };
+    }
+    case "edit": {
+      const perFile = new Map<string, number>();
+      for (const e of (a.edits?.length ? a.edits : [a]) as Args[]) perFile.set(String(e.file_path ?? "?"), (perFile.get(String(e.file_path ?? "?")) ?? 0) + 1);
+      return { host, what: [...perFile].map(([p, n]) => `${p} (${n} edit${n === 1 ? "" : "s"})`).join(", ") };
+    }
+    case "sftp_read": case "sftp_list": return { host, what: a.path };
+    case "sftp_write": {
+      const bytes = Buffer.from(String(a.content ?? ""), a.encoding === "base64" ? "base64" : "utf8").length;
+      return { host, what: `${a.path} (${bytes} B)`, bytes };
+    }
+    case "ssh_job": return { host, what: `${a.action} ${a.jobId}` };
+    case "batch": return { host, what: `${((a.ops ?? []) as unknown[]).length} ops` };
+    case "bridge": return { what: `ttl_hours=${a.ttl_hours}` };
+    case "audit": return { what: [a.contains !== undefined ? `contains=${JSON.stringify(a.contains)}` : "", a.limit !== 50 ? `limit=${a.limit}` : "", a.since_minutes ? `since_minutes=${a.since_minutes}` : ""].filter(Boolean).join(" ") };
+    default: return { host };
+  }
+}
+
+async function auditTail(file: string): Promise<string> {
+  const fh = await fs.open(file, "r").catch(() => null);
+  if (!fh) return "";
+  try {
+    const { size } = await fh.stat(), from = Math.max(0, size - AUDIT_TAIL), buf = Buffer.alloc(size - from);
+    await fh.read(buf, 0, buf.length, from);
+    const s = buf.toString("utf8");
+    return from > 0 ? s.slice(s.indexOf("\n") + 1) : s; // the first line was cut in half: drop it
+  } finally { await fh.close(); }
+}
+// The log as text, one line per call (its two records joined): time, address, route, tool, host, result, duration, what.
+async function auditShow(limit: number, contains: string | undefined, sinceMinutes: number | undefined, self: string | undefined): Promise<string> {
+  await auditQueue; // everything written so far is on disk
+  const starts = new Map<string, Args>(), entries: Args[] = [];
+  for (const line of `${await auditTail(`${auditFile}.1`)}${await auditTail(auditFile)}`.split("\n")) {
+    if (!line) continue;
+    let r: Args;
+    try { r = JSON.parse(line); } catch { continue; }
+    if (r.event) entries.push(r);
+    else if (r.tool) { if (r.id !== self) { starts.set(r.id, r); entries.push(r); } } // a query does not list itself
+    else { const start = starts.get(r.id); if (start) start.end = r; }
+  }
+  const secs = (t: unknown) => `${String(t).slice(0, 19)}Z`;
+  const flat = (t: string) => t.replace(/\s*\n\s*/g, " ⏎ ");
+  const show = (r: Args): string => {
+    if (r.event) return r.event === "start" ? `${secs(r.t)}  server started: v${r.version}, pid ${r.pid}` : `${secs(r.t)}  audit log ${r.event}: ${r.why ?? ""}`.trimEnd();
+    const e: Args | undefined = r.end;
+    const result = !e ? "no result (still running, or the server stopped)"
+      : Array.isArray(e.exits) && !e.ok ? `exits ${e.exits.join(",")}`
+      : typeof e.exit === "number" && e.exit !== 0 ? `exit ${e.exit}`
+      : e.ok ? "ok" : `FAILED${e.err ? `: ${clip(flat(String(e.err)), 160)}` : ""}`;
+    const what = [r.bg ? "[background]" : "", r.cwd ? `(in ${r.cwd})` : "", r.what ?? ""].filter(Boolean).join(" ");
+    return [secs(r.t), r.ip ?? "-", r.via ?? "-", `${r.tool}${r.batch ? `#${String(r.batch).split("#")[1]}` : ""}`, r.host ?? "-", result,
+      e ? `${(Number(e.ms) / 1000).toFixed(2)}s` : "-", clip(flat(what), 300)].join("  ").trimEnd();
+  };
+  const after = sinceMinutes === undefined ? -Infinity : Date.now() - sinceMinutes * 60_000;
+  const needle = contains?.toLowerCase();
+  const lines = entries.filter((r) => Date.parse(r.t) >= after).map(show).filter((l) => needle === undefined || l.toLowerCase().includes(needle));
+  const head = `audit log: ${auditFile} - `;
+  return lines.length ? `${head}${Math.min(limit, lines.length)} of ${lines.length} matching entries, oldest first\n${lines.slice(-limit).join("\n")}` : `${head}no matching entries`;
+}
+
+function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: "?" }): McpServer {
+  const server = new McpServer({ name: "ssh-connector", version: VERSION }, { instructions: INSTRUCTIONS });
+  // Tools are registered through `tool`, never directly: that is what puts every call in the audit log before it runs.
+  const register = server.registerTool.bind(server) as unknown as (name: string, config: unknown, cb: (...xs: unknown[]) => Promise<ToolOut>) => unknown;
+  const tool = ((name: string, config: unknown, cb: (...xs: unknown[]) => Promise<ToolOut>) =>
+    register(name, config, (...xs: unknown[]) => audited(who, name, auditInfo(name, xs.length > 1 ? (xs[0] as Args) : {}), () => cb(...xs), toolEnd))) as unknown as McpServer["registerTool"];
+
+  tool("list_hosts", {
     description: "List SSH hosts this connector can reach.",
     inputSchema: {},
   }, async () => {
@@ -523,7 +732,7 @@ function buildServer(base = "", viaBridge = false): McpServer {
     return text(Object.entries(h).map(([k, v]) => v.local ? `${k}: (this VPS)` : `${k}: ${v.username}@${v.host}:${v.port ?? 22}`).join("\n"));
   });
 
-  server.registerTool("ssh_exec", {
+  tool("ssh_exec", {
     description: "Run a shell command on a named host. Returns exit code, stdout, stderr.",
     inputSchema: {
       host: z.string().describe("Host name from list_hosts"),
@@ -533,11 +742,12 @@ function buildServer(base = "", viaBridge = false): McpServer {
   }, async ({ host, command, timeout_sec }) => {
     try {
       const r = await runCommand(host, command, timeout_sec);
+      auditNote({ exit: r.code });
       return text(`exit: ${r.code}\n--- stdout ---\n${trunc(r.stdout)}\n--- stderr ---\n${trunc(r.stderr)}`);
     } catch (e) { return fail(e); }
   });
 
-  server.registerTool("sftp_read", {
+  tool("sftp_read", {
     description: "Read a file from a host (utf8 text, or base64 for binary).",
     inputSchema: {
       host: z.string(),
@@ -548,7 +758,7 @@ function buildServer(base = "", viaBridge = false): McpServer {
     try { return text(trunc((await readRemote(host, path)).toString(encoding))); } catch (e) { return fail(e); }
   });
 
-  server.registerTool("sftp_write", {
+  tool("sftp_write", {
     description: "Write a file on a host (overwrites).",
     inputSchema: {
       host: z.string(),
@@ -565,7 +775,7 @@ function buildServer(base = "", viaBridge = false): McpServer {
     } catch (e) { return fail(e); }
   });
 
-  server.registerTool("sftp_list", {
+  tool("sftp_list", {
     description: "List a directory on a host.",
     inputSchema: { host: z.string(), path: z.string().default(".") },
   }, async ({ host, path }) => {
@@ -574,7 +784,7 @@ function buildServer(base = "", viaBridge = false): McpServer {
 
   // ── v1.1 tools ──────────────────────────────────────────────────────────────
 
-  server.registerTool("ssh_exec_many", {
+  tool("ssh_exec_many", {
     description: "Run up to 10 shell commands concurrently on one host. Returns one block per id: exit code, stdout, stderr, duration.",
     inputSchema: {
       host: z.string().describe("Host name from list_hosts"),
@@ -594,6 +804,7 @@ function buildServer(base = "", viaBridge = false): McpServer {
       const ms: number[] = [];
       const done = await Promise.allSettled(commands.map((c, i) =>
         runCommand(host, c.command, c.timeout_sec).finally(() => { ms[i] = Date.now() - t0; })));
+      auditNote({ exits: done.map((d) => (d.status === "fulfilled" ? d.value.code : null)) });
       return text(done.map((d, i) => {
         const head = `=== [${commands[i].id}] `, dur = ` | ${(ms[i] / 1000).toFixed(2)}s ===`;
         return d.status === "fulfilled"
@@ -603,7 +814,7 @@ function buildServer(base = "", viaBridge = false): McpServer {
     } catch (e) { return fail(e); }
   });
 
-  server.registerTool("ssh_spawn", {
+  tool("ssh_spawn", {
     description: "Start a long-running shell command in the background on a host (bash under setsid/nohup) and return a jobId immediately. " +
       `Output goes to ${JOBS_DIR}/<jobId>.log and the exit code to <jobId>.exit. Follow up with ssh_job (status | tail | wait | kill) or ssh_jobs.`,
     inputSchema: {
@@ -616,11 +827,12 @@ function buildServer(base = "", viaBridge = false): McpServer {
       const id = newJobId();
       const r = await runScript(host, spawnScript(id, command), 60);
       if (r.code !== 0) throw new Error(`spawn failed (exit ${r.code}): ${(r.stderr || r.stdout).trim()}`);
+      auditNote({ job: id });
       return text(`${r.stdout.trim()}\nnext: ssh_job { host: "${host}", jobId: "${id}", action: "tail" | "wait" | "status" | "kill" }`);
     } catch (e) { return fail(e); }
   });
 
-  server.registerTool("ssh_job", {
+  tool("ssh_job", {
     description: "Inspect or control a background job started with ssh_spawn. status: state (running | exited | lost) and exit code. " +
       "tail: status plus the last `bytes` of the log. wait: block until the job exits or timeout_sec passes, then status plus log tail. " +
       "kill: SIGTERM the job's process group, SIGKILL after 5s.",
@@ -639,7 +851,7 @@ function buildServer(base = "", viaBridge = false): McpServer {
     } catch (e) { return fail(e); }
   });
 
-  server.registerTool("ssh_jobs", {
+  tool("ssh_jobs", {
     description: "List background jobs on a host, newest first: jobId, state (running | exited | lost), exit code, elapsed time, start time, command.",
     inputSchema: {
       host: z.string().describe("Host name from list_hosts"),
@@ -653,7 +865,7 @@ function buildServer(base = "", viaBridge = false): McpServer {
     } catch (e) { return fail(e); }
   });
 
-  server.registerTool("exec_code", {
+  tool("exec_code", {
     description: "Write a code snippet to a temp file on a host and run it with python3, node or bash. Returns exit code, stdout, stderr.",
     inputSchema: {
       host: z.string().describe("Host name from list_hosts"),
@@ -666,6 +878,7 @@ function buildServer(base = "", viaBridge = false): McpServer {
       checkPayload("code", code);
       const t0 = Date.now();
       const r = await runScript(host, codeScript(language, code, timeout_sec), timeout_sec + 15);
+      auditNote({ exit: r.code });
       const note = (r.code === 124 || r.code === 137) && Date.now() - t0 >= timeout_sec * 1000 ? ` (timed out after ${timeout_sec}s)` : "";
       return text(`exit: ${r.code}${note}\n--- stdout ---\n${trunc(r.stdout)}\n--- stderr ---\n${trunc(r.stderr)}`);
     } catch (e) { return fail(e); }
@@ -692,15 +905,18 @@ function buildServer(base = "", viaBridge = false): McpServer {
         const cdExpr = cwd ? `printf %s ${shq(cwd)}` : session ? `cat "$(dirname "$D")/sessions/${session}.cwd" 2>/dev/null || printf %s ~` : "printf %s ~";
         const r = await runScript(host, spawnScript(id, command, cdExpr), 60);
         if (r.code !== 0) throw new Error(`spawn failed (exit ${r.code}): ${(r.stderr || r.stdout).trim()}`);
+        auditNote({ job: id });
         return { out: text(`${r.stdout.trim()}\nnext: ssh_job { host: "${host}", jobId: "${id}", action: "tail" | "wait" | "status" | "kill" }`), ok: true };
       }
       const sec = Math.ceil(timeout / 1000);
       const r = await runScript(host, bashScript({ command, timeoutSec: sec, cwd, session, keep: outLimit(budget, quiet), noteMove: inBatch }), sec + 20);
       if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || `exit ${r.code}`);
-      return { out: text(r.stdout === "" ? "(no output)" : r.stdout), ok: /^rc=0$/m.test(r.stderr) };
+      const m = /^rc=(-?\d+)$/m.exec(r.stderr), rc = m ? Number(m[1]) : null; // the command's own exit code
+      auditNote({ exit: rc });
+      return { out: text(r.stdout === "" ? "(no output)" : r.stdout), ok: rc === 0 };
     } catch (e) { return { out: fail(e), ok: false }; }
   };
-  server.registerTool("bash", {
+  tool("bash", {
     description: "Run a shell command on a host: the remote twin of the local Bash tool. stdout and stderr come back merged, in order; a non-zero exit adds an [exit code: N] line. " +
       "Working directory: pass `cwd`, or pass the same `session` name on every call to make `cd` persist between calls; with neither, each call starts in the home directory. " +
       "Output over ~100 KB is cut in the middle and kept in full in a file on the host (read it with `read`). Use run_in_background for long jobs, then ssh_job.",
@@ -773,7 +989,7 @@ function buildServer(base = "", viaBridge = false): McpServer {
       return { content, isError: out.every((o) => "err" in o) };
     } catch (e) { return fail(e); }
   };
-  server.registerTool("read", {
+  tool("read", {
     description: "Read files on a host: the remote twin of the local Read tool, and bulk-capable. Text comes back as numbered lines (cat -n style); use offset/limit for long files. " +
       "Images (png, jpg, gif, webp) come back as images. Pass file_path for one file, or `files` for up to 20 files read in one call.",
     inputSchema: readShape,
@@ -812,7 +1028,7 @@ function buildServer(base = "", viaBridge = false): McpServer {
       } finally { fx.close(); }
     } catch (e) { return fail(e); }
   };
-  server.registerTool("write", {
+  tool("write", {
     description: "Create or overwrite files on a host: the remote twin of the local Write tool, and bulk-capable. Pass file_path + content for one file, or `files` for up to 50 files written in parallel in one call. " +
       "Parent directories are created; an existing file keeps its mode and owner. For large or binary files use the bridge instead.",
     inputSchema: writeShape,
@@ -874,7 +1090,7 @@ function buildServer(base = "", viaBridge = false): McpServer {
       } finally { fx.close(); }
     } catch (e) { return fail(e); }
   };
-  server.registerTool("edit", {
+  tool("edit", {
     description: "Replace exact text in files on a host: the remote twin of the local Edit tool, and bulk-capable. old_string must match exactly and be unique in the file unless replace_all is set. " +
       "Pass file_path/old_string/new_string for one edit, or `edits` for up to 50 edits across files in one call: edits to the same file apply in order, and a file is written only if all of its edits succeed.",
     inputSchema: editShape,
@@ -889,7 +1105,7 @@ function buildServer(base = "", viaBridge = false): McpServer {
     write: z.object(writeShape).omit({ host: true }).optional().describe("Write files: arguments of the write tool"),
     edit: z.object(editShape).omit({ host: true }).optional().describe("Replace text in files: arguments of the edit tool"),
   });
-  server.registerTool("batch", {
+  tool("batch", {
     description: "Run several steps on one host in ONE call: the fastest way to do multi-step work, because every separate tool call is a round trip. " +
       "Each op is exactly one of {bash}, {read}, {write}, {edit}, with the arguments of the tool of that name (without host). Ops run in order; the batch stops at the first failure " +
       "(non-zero exit, timeout, failed edit, missing file) and skips the rest, unless stop_on_error is false. A `cd` in one bash op carries to the later bash ops of the batch. " +
@@ -915,7 +1131,7 @@ function buildServer(base = "", viaBridge = false): McpServer {
       const content: Block[] = [];
       const say = (t: string) => { const last = content[content.length - 1]; if (last?.type === "text") last.text += t; else content.push({ type: "text", text: t }); };
       let okN = 0, failN = 0, skipN = 0, firstBash = true;
-      const t0 = Date.now();
+      const t0 = Date.now(), batchId = auditScope.getStore()?.id;
       for (let i = 0; i < ops.length; i++) {
         const op = ops[i], kind = kinds[i];
         const label = kind === "bash" ? oneLine(op.bash!.description ?? op.bash!.command)
@@ -925,13 +1141,15 @@ function buildServer(base = "", viaBridge = false): McpServer {
         const head = `=== [${i + 1}/${ops.length}] ${kind} ${label} | `;
         if (failN > 0 && stop_on_error) { skipN++; say(`${head}skipped ===\n`); continue; }
         const s0 = Date.now();
+        const link = batchId ? { batch: `${batchId}#${i + 1}/${ops.length}` } : {}; // each step has its own audit record
         let out: ToolOut, ok: boolean;
         if (kind === "bash") {
-          const a = op.bash!;
-          const r = await runBash({ ...a, host, cwd: a.cwd ?? (firstBash ? cwd : undefined), session: a.session ?? sess }, per - 300, true);
+          const a = { ...op.bash!, host, cwd: op.bash!.cwd ?? (firstBash ? cwd : undefined), session: op.bash!.session ?? sess };
+          const r = await audited(who, "bash", { ...auditInfo("bash", a), ...link }, () => runBash(a, per - 300, true), (x) => toolEnd(x.out));
           firstBash = false; out = r.out; ok = r.ok;
         } else {
-          out = kind === "read" ? await readTool({ ...op.read!, host }, per) : kind === "write" ? await writeTool({ ...op.write!, host }) : await editTool({ ...op.edit!, host });
+          const run = kind === "read" ? () => readTool({ ...op.read!, host }, per) : kind === "write" ? () => writeTool({ ...op.write!, host }) : () => editTool({ ...op.edit!, host });
+          out = await audited(who, kind, { ...auditInfo(kind, { ...op[kind], host }), ...link }, run, toolEnd);
           ok = !out.isError;
         }
         if (ok) okN++; else failN++;
@@ -943,11 +1161,12 @@ function buildServer(base = "", viaBridge = false): McpServer {
         }
       }
       say(`=== batch: ${okN} ok, ${failN} failed, ${skipN} skipped | ${((Date.now() - t0) / 1000).toFixed(2)}s ===`);
+      auditNote({ ops: `${okN} ok, ${failN} failed, ${skipN} skipped`, err: failN ? `${failN} of ${ops.length} ops failed` : undefined });
       return { content, isError: failN > 0 };
     } catch (e) { return fail(e); }
   });
 
-  server.registerTool("bridge", {
+  tool("bridge", {
     description: "Open a direct path from your own sandbox shell to this server, so files and command output move at network speed without passing through the model. " +
       "Returns a time-limited URL and a one-line installer for the `box` command (exec, put, get, push, pull, call). Use it for bulk transfers, whole directories, binaries, and scripted sequences of commands.",
     inputSchema: { ttl_hours: z.number().min(1).max(168).default(12).describe("How long the URL stays valid") },
@@ -955,6 +1174,7 @@ function buildServer(base = "", viaBridge = false): McpServer {
     // A bridge URL must expire when it says it does, so it cannot be used to mint its own successor.
     if (viaBridge) return fail(new Error("A bridge URL cannot create another one - call the bridge tool through the connector itself"));
     const { exp, token } = mintBridgeToken(Math.round(ttl_hours * 3600));
+    auditNote({ tok: exp.toString(36) }); // requests made through this URL carry the same "tok" in the log
     const url = `${base}/b/${token}`;
     return text([
       `Bridge URL (valid until ${new Date(exp * 1000).toISOString().slice(0, 16)}Z): ${url}`,
@@ -973,6 +1193,24 @@ function buildServer(base = "", viaBridge = false): McpServer {
     ].join("\n"));
   });
 
+  // ── v1.4 ──
+  tool("audit", {
+    description: "Show this connector's audit log: one line per tool call and bridge request, oldest first - time (UTC), client address, route, tool, host, result, duration, " +
+      "and the command or the paths. Calls from every chat and every client are in it; file contents never are.",
+    inputSchema: {
+      limit: z.number().int().min(1).max(500).default(50).describe("Show the newest N matching entries"),
+      contains: z.string().min(1).max(200).optional().describe("Only entries whose line contains this text (case-insensitive): part of a command or path, a tool name, a host, an address"),
+      since_minutes: z.number().int().min(1).max(525_600).optional().describe("Only entries from the last N minutes"),
+    },
+  }, async ({ limit, contains, since_minutes }) => {
+    try {
+      if (AUDIT_OFF) return text("The audit log is turned off on this server (AUDIT_LOG=off).");
+      if (!auditFile) throw new Error(`the audit log is not being written: ${auditErr}`);
+      const shown = await auditShow(limit, contains, since_minutes, auditScope.getStore()?.id);
+      return text(trunc(auditErr ? `${shown}\nWARNING: the last write to the audit log failed: ${auditErr}` : shown));
+    } catch (e) { return fail(e); }
+  });
+
   return server;
 }
 
@@ -985,7 +1223,7 @@ const publicBase = (req: express.Request) =>
 
 // Stateless Streamable HTTP: fresh server + transport per request.
 const mcpHandler = async (req: express.Request, res: express.Response) => {
-  const server = buildServer(publicBase(req), typeof (req.params as Record<string, string>).token === "string");
+  const server = buildServer(publicBase(req), typeof (req.params as Record<string, string>).token === "string", whoOf(req));
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on("close", () => { transport.close(); server.close(); });
   try {
@@ -1024,23 +1262,33 @@ const guarded = (fn: (req: express.Request, res: express.Response) => Promise<vo
 
 bridge.post("/mcp", json, mcpHandler);
 
-bridge.get("/cli", (req, res) => {
-  const script = readFileSync(new URL("./box.sh", import.meta.url), "utf8");
-  const token = (req.params as Record<string, string>).token; // from the parent route /b/:token (mergeParams)
-  res.type("text/plain").send(script.replaceAll("__BOX_URL__", `${publicBase(req)}/b/${token}`).replaceAll("__BOX_VERSION__", VERSION));
-});
+// Every bridge request below is audited like a tool call (bridge.cli / get / put / pull / push / exec).
+const same = (e: AuditEnd) => e;
+
+bridge.get("/cli", guarded(async (req, res) => {
+  await audited(whoOf(req), "bridge.cli", {}, async (): Promise<AuditEnd> => {
+    const script = readFileSync(new URL("./box.sh", import.meta.url), "utf8");
+    const token = (req.params as Record<string, string>).token; // from the parent route /b/:token (mergeParams)
+    res.type("text/plain").send(script.replaceAll("__BOX_URL__", `${publicBase(req)}/b/${token}`).replaceAll("__BOX_VERSION__", VERSION));
+    return { ok: true };
+  }, same);
+}));
 
 // GET /fs/<host>?p64=<path>  ->  the file's bytes
 bridge.get("/fs/:host", guarded(async (req, res) => {
   const host = hostOf(req, res); if (!host) return;
   const p = absPath(req, res); if (!p) return;
-  const st = await runScript(host, `f=${shq(p)}; [ -f "$f" ] && [ -r "$f" ] && wc -c < "$f"`, 30);
-  if (st.code !== 0) return plain(res, 404, `No such readable file: ${host}:${p}`);
-  const size = Number(st.stdout.trim());
-  res.status(200).set({ "Content-Type": "application/octet-stream", "Content-Length": String(size) });
-  const r = await streamExec(host, `head -c ${size} -- ${shq(p)}`, null, res);
-  if (r.aborted || r.code !== 0) return void res.destroy(); // the client sees a broken transfer, never a silently short file
-  res.end();
+  await audited(whoOf(req), "bridge.get", { host, what: p }, async (): Promise<AuditEnd> => {
+    const st = await runScript(host, `f=${shq(p)}; [ -f "$f" ] && [ -r "$f" ] && wc -c < "$f"`, 30);
+    if (st.code !== 0) { plain(res, 404, `No such readable file: ${host}:${p}`); return { ok: false, err: "no such readable file" }; }
+    const size = Number(st.stdout.trim());
+    res.status(200).set({ "Content-Type": "application/octet-stream", "Content-Length": String(size) });
+    const r = await streamExec(host, `head -c ${size} -- ${shq(p)}`, null, res);
+    // on failure the client sees a broken transfer, never a silently short file
+    if (r.aborted || r.code !== 0) { res.destroy(); return { ok: false, err: r.aborted ? "the client disconnected" : `exit ${r.code}`, bytes: size }; }
+    res.end();
+    return { ok: true, bytes: size };
+  }, same);
 }));
 
 // PUT /fs/<host>?p64=<path>[&mode=0644]  <-  request body becomes the file (parent directories are created).
@@ -1053,8 +1301,9 @@ bridge.put("/fs/:host", guarded(async (req, res) => {
   if (mode !== undefined && !/^[0-7]{3,4}$/.test(mode)) return plain(res, 400, "mode must be octal, e.g. 0644");
   const want = req.headers["content-length"];
   if (want === undefined || !/^\d+$/.test(want)) return plain(res, 411, "Content-Length is required");
-  const out = new PassThrough(); let wrote = ""; out.on("data", (d) => (wrote += d));
-  const r = await streamExec(host, `f=${shq(p)}; if [ -L "$f" ]; then f=$(readlink -f -- "$f") || exit 1; fi
+  await audited(whoOf(req), "bridge.put", { host, what: `${p} (${Number(want)} B)`, bytes: Number(want) }, async (): Promise<AuditEnd> => {
+    const out = new PassThrough(); let wrote = ""; out.on("data", (d) => (wrote += d));
+    const r = await streamExec(host, `f=${shq(p)}; if [ -L "$f" ]; then f=$(readlink -f -- "$f") || exit 1; fi
 [ ! -d "$f" ] || { echo "Path is a directory: $f" >&2; exit 1; }
 t="$f.part.$$"; trap 'rm -f -- "$t"' EXIT
 mkdir -p -- "$(dirname -- "$f")" && cat > "$t" || exit 1
@@ -1063,9 +1312,11 @@ n=$(wc -c < "$t" | tr -d ' ')
 if [ -e "$f" ]; then chown --reference="$f" -- "$t" 2>/dev/null; chmod --reference="$f" -- "$t" 2>/dev/null; fi
 ${mode ? `chmod ${mode} -- "$t" || exit 1` : ":"}
 mv -f -- "$t" "$f" && echo "$n"`, req, out);
-  if (r.aborted) return void res.destroy();
-  if (r.code !== 0) return plain(res, 500, r.stderr.trim() || `write failed (exit ${r.code})`);
-  plain(res, 200, `wrote ${wrote.trim()} bytes to ${host}:${p}`);
+    if (r.aborted) { res.destroy(); return { ok: false, err: "the client disconnected" }; }
+    if (r.code !== 0) { const msg = r.stderr.trim() || `write failed (exit ${r.code})`; plain(res, 500, msg); return { ok: false, err: msg }; }
+    plain(res, 200, `wrote ${wrote.trim()} bytes to ${host}:${p}`);
+    return { ok: true };
+  }, same);
 }));
 
 // GET /tar/<host>?p64=<dir>[&x64=<exclude pattern>...]  ->  the directory tree as tar.gz
@@ -1073,23 +1324,33 @@ bridge.get("/tar/:host", guarded(async (req, res) => {
   const host = hostOf(req, res); if (!host) return;
   const dir = absPath(req, res); if (!dir) return;
   const ex = [...qlist(req.query.x), ...qlist(req.query.x64).map((x) => Buffer.from(x, "base64url").toString("utf8"))];
-  const chk = await runScript(host, `[ -d ${shq(dir)} ] && [ -r ${shq(dir)} ]`, 30);
-  if (chk.code !== 0) return plain(res, 404, `No such readable directory: ${host}:${dir}`);
-  res.status(200).set({ "Content-Type": "application/gzip" });
-  const r = await streamExec(host, `tar -C ${shq(dir)} ${ex.map((x) => `--exclude=${shq(x)}`).join(" ")} -czf - .`, null, res);
-  // tar exits 1 when a file changed while it was read (the archive is still good); anything worse breaks the transfer
-  if (r.aborted || r.code === null || r.code > 1) { if (!r.aborted) console.error(`tar ${host}:${dir} failed (exit ${r.code}): ${r.stderr.trim()}`); return void res.destroy(); }
-  res.end();
+  await audited(whoOf(req), "bridge.pull", { host, what: `${dir}${ex.length ? ` (exclude: ${ex.join(", ")})` : ""}` }, async (): Promise<AuditEnd> => {
+    const chk = await runScript(host, `[ -d ${shq(dir)} ] && [ -r ${shq(dir)} ]`, 30);
+    if (chk.code !== 0) { plain(res, 404, `No such readable directory: ${host}:${dir}`); return { ok: false, err: "no such readable directory" }; }
+    res.status(200).set({ "Content-Type": "application/gzip" });
+    const r = await streamExec(host, `tar -C ${shq(dir)} ${ex.map((x) => `--exclude=${shq(x)}`).join(" ")} -czf - .`, null, res);
+    // tar exits 1 when a file changed while it was read (the archive is still good); anything worse breaks the transfer
+    if (r.aborted || r.code === null || r.code > 1) {
+      if (!r.aborted) console.error(`tar ${host}:${dir} failed (exit ${r.code}): ${r.stderr.trim()}`);
+      res.destroy();
+      return { ok: false, err: r.aborted ? "the client disconnected" : `tar failed (exit ${r.code}): ${r.stderr.trim()}` };
+    }
+    res.end();
+    return { ok: true };
+  }, same);
 }));
 
 // PUT /tar/<host>?p64=<dir>  <-  a tar.gz stream, unpacked into the directory (created if missing)
 bridge.put("/tar/:host", guarded(async (req, res) => {
   const host = hostOf(req, res); if (!host) return;
   const dir = absPath(req, res); if (!dir) return;
-  const r = await streamExec(host, `d=${shq(dir)}; mkdir -p -- "$d" && tar -C "$d" --no-same-owner -xzf -`, req, new PassThrough().resume());
-  if (r.aborted) return void res.destroy();
-  if (r.code !== 0) return plain(res, 500, r.stderr.trim() || `unpack failed (exit ${r.code})`);
-  plain(res, 200, `unpacked into ${host}:${dir}`);
+  await audited(whoOf(req), "bridge.push", { host, what: dir }, async (): Promise<AuditEnd> => {
+    const r = await streamExec(host, `d=${shq(dir)}; mkdir -p -- "$d" && tar -C "$d" --no-same-owner -xzf -`, req, new PassThrough().resume());
+    if (r.aborted) { res.destroy(); return { ok: false, err: "the client disconnected" }; }
+    if (r.code !== 0) { const msg = r.stderr.trim() || `unpack failed (exit ${r.code})`; plain(res, 500, msg); return { ok: false, err: msg }; }
+    plain(res, 200, `unpacked into ${host}:${dir}`);
+    return { ok: true };
+  }, same);
 }));
 
 // POST /exec/<host>[?timeout=<sec>&c64=<cwd>]  body = command  ->  merged output of any size, streamed;
@@ -1100,33 +1361,43 @@ bridge.post("/exec/:host", express.text({ type: () => true, limit: "1mb" }), gua
   if (!command.trim()) return plain(res, 400, "the request body must be the command to run");
   if (Buffer.byteLength(command) > MAX_PAYLOAD) return plain(res, 413, `command too large (max ${MAX_PAYLOAD} bytes) - upload it as a script and run that`);
   const t = Math.min(1800, Math.max(1, Math.floor(Number(qstr(req.query.timeout) ?? 120)) || 120));
-  // The script answers with one header line, "rc=<exit code> size=<bytes>", then the output itself.
-  let head: Buffer | null = Buffer.alloc(0), started = false;
-  const body = new Transform({
-    transform(chunk: Buffer, _enc, cb) {
-      if (head === null) return cb(null, chunk);
-      head = Buffer.concat([head, chunk]);
-      const nl = head.indexOf(10);
-      const m = nl < 0 ? null : /^rc=(-?\d+) size=(\d+)$/.exec(head.subarray(0, nl).toString("latin1"));
-      if (!m) return cb(nl < 0 && head.length < 64 ? null : new Error("unexpected output from the exec script"));
-      started = true;
-      res.status(200).set({ "Content-Type": "text/plain; charset=utf-8", "Content-Length": m[2], "X-Exit-Code": m[1] });
-      const rest = head.subarray(nl + 1);
-      head = null;
-      cb(null, rest);
-    },
-  });
-  body.on("error", () => {});
-  res.once("close", () => { if (!res.writableFinished) body.destroy(); }); // client gone: stop the script
-  body.pipe(res);
-  const r = await streamExec(host, bashScript({ command, timeoutSec: t, cwd: qval(req, "c64", "cwd"), raw: true }), null, body);
-  if (!started) { body.unpipe(res); return res.destroyed ? undefined : plain(res, 500, r.stderr.trim() || `exec failed (exit ${r.code})`); }
-  if (r.aborted || r.code !== 0) return void res.destroy();
-  body.end();
+  const cwd = qval(req, "c64", "cwd");
+  await audited(whoOf(req), "bridge.exec", { host, what: command, ...(cwd ? { cwd } : {}) }, async (): Promise<AuditEnd> => {
+    // The script answers with one header line, "rc=<exit code> size=<bytes>", then the output itself.
+    let head: Buffer | null = Buffer.alloc(0), started = false, rc: number | null = null;
+    const body = new Transform({
+      transform(chunk: Buffer, _enc, cb) {
+        if (head === null) return cb(null, chunk);
+        head = Buffer.concat([head, chunk]);
+        const nl = head.indexOf(10);
+        const m = nl < 0 ? null : /^rc=(-?\d+) size=(\d+)$/.exec(head.subarray(0, nl).toString("latin1"));
+        if (!m) return cb(nl < 0 && head.length < 64 ? null : new Error("unexpected output from the exec script"));
+        started = true; rc = Number(m[1]);
+        res.status(200).set({ "Content-Type": "text/plain; charset=utf-8", "Content-Length": m[2], "X-Exit-Code": m[1] });
+        const rest = head.subarray(nl + 1);
+        head = null;
+        cb(null, rest);
+      },
+    });
+    body.on("error", () => {});
+    res.once("close", () => { if (!res.writableFinished) body.destroy(); }); // client gone: stop the script
+    body.pipe(res);
+    const r = await streamExec(host, bashScript({ command, timeoutSec: t, cwd, raw: true }), null, body);
+    if (!started) {
+      const msg = r.stderr.trim() || `exec failed (exit ${r.code})`;
+      body.unpipe(res);
+      if (!res.destroyed) plain(res, 500, msg);
+      return { ok: false, err: r.aborted ? "the client disconnected" : msg };
+    }
+    if (r.aborted || r.code !== 0) { res.destroy(); return { ok: false, exit: rc, err: r.aborted ? "the client disconnected" : `the exec script failed (exit ${r.code})` }; }
+    body.end();
+    return { ok: true, exit: rc };
+  }, same);
 }));
 
 app.use("/b/:token", (req, res, next) => { if (bridgeTokenOk(String(req.params.token))) next(); else res.status(404).end(); }, bridge);
 
 app.use((_req, res) => { res.status(404).end(); });
 
+await auditInit();
 app.listen(PORT, "127.0.0.1", () => console.log(`ssh-mcp listening on 127.0.0.1:${PORT}`));

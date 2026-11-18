@@ -16,7 +16,7 @@ ssh-mcp on your VPS ──SSH/SFTP──▶ any host in hosts.json
 > On AWS EC2, anyone with the URL can also use the instance's IAM role - check what that role allows
 > before you install (see [Security](#security)).
 
-16 tools, one install command, no account, no database. Version 1.3.0.
+17 tools, one install command, no account, no database. Version 1.4.0.
 
 ## Quick start
 
@@ -126,6 +126,7 @@ Same parameter names as the Bash / Read / Write / Edit tools many coding agents 
 | `list_hosts` | - | Lists the hosts in `hosts.json`. |
 | `sftp_read` / `sftp_write` / `sftp_list` | `path`, ... | Plain file read (utf8/base64), write and directory listing. |
 | `bridge` | `ttl_hours` (12, max 168) | Returns a time-limited URL and a one-line installer for the `box` command (below). |
+| `audit` | `limit` (50), `contains`, `since_minutes` | Shows the audit log (below): what was run on the hosts, from any chat or client. |
 
 Which one to use: `batch` for anything with more than one step; `bash` / `read` / `write` / `edit` for single steps;
 `ssh_exec_many` for several independent commands; `run_in_background` + `ssh_job` for anything long; the bridge for
@@ -165,7 +166,7 @@ box put  ./file [HOST:]/remote/path [MODE]       # one file, any size, binary-sa
 box get  [HOST:]/remote/path [./file|-]
 box push ./dir [HOST:]/remote/dir [-x PATTERN]   # whole tree as one tar.gz stream
 box pull [HOST:]/remote/dir ./dir [-x PATTERN]
-box call TOOL '{json}'                           # any of the 16 tools
+box call TOOL '{json}'                           # any of the 17 tools
 box tools
 ```
 
@@ -177,6 +178,37 @@ about 8 s, a 4,300-file tree in under 4 s, one command in about 0.6 s.
 - A dropped connection stops the transfer on the host.
 - The token is `<expiry>.<HMAC of expiry with MCP_SECRET>`: no state, valid until it expires, and it cannot mint
   another one. **It grants the same access as the connector URL.** The only way to revoke one early is a new secret.
+
+## Audit log
+
+Every tool call and every bridge request is written to `/var/lib/ssh-mcp/audit/audit.jsonl`, readable only by the
+user the service runs as. Ask the assistant *"show me the audit log"* (the `audit` tool), or read the file:
+
+```
+$ tail -f /var/lib/ssh-mcp/audit/audit.jsonl | jq -c .
+{"t":"2026-11-18T15:30:01.120Z","id":"9f2c41aa","via":"mcp","ip":"203.0.113.5","ua":"Claude-User","tool":"bash","host":"local","what":"npm test","cwd":"/app"}
+{"t":"2026-11-18T15:30:05.320Z","id":"9f2c41aa","ok":false,"exit":1,"ms":4200}
+```
+
+- **Two lines per call.** The first is written *before* the call runs, so a command that takes the server down with
+  it is still on record; the second carries the result (`ok`, `exit`, `err`, `ms`). They share an `id`.
+- **Who:** `ip` is the address your reverse proxy saw, `ua` the client's user agent, `via` is `mcp` (the connector
+  URL) or `bridge`; `tok` ties a bridge request to the `bridge` call that created its URL.
+- **What:** for commands the command itself; for file tools the paths and sizes. **File contents are never logged.**
+  Each step of a `batch` has its own entry (`batch: "<id>#2/4"`).
+- **Masking:** values that look like credentials (`password=...`, `--token ...`, `Authorization: Bearer ...`, private
+  keys, the connector's own secret and bridge tokens) are replaced with `***` before anything is written, and long
+  commands are cut to 2000 characters. This is best effort: do not rely on it to keep secrets out of the log.
+- **Server events:** every start of the server is logged, and if the file is removed, emptied or replaced, the next
+  entry says so (`"event":"reset"`).
+- **Rotation:** at 20 MB the file moves to `audit.jsonl.1` (up to `.5`), so the log is bounded at about 120 MB.
+
+Settings (in `/etc/ssh-mcp.env`, then restart): `AUDIT_MAX_MB` (20), `AUDIT_KEEP` (5), `AUDIT_DIR`, and
+`AUDIT_LOG=off` to turn it off.
+
+What it is not: requests with a wrong secret are not logged (use your proxy's access log for that), and the log
+lives on the machine it describes - whoever has the connector URL can also delete it. If it has to survive that,
+ship it elsewhere (any log forwarder can follow the file).
 
 ## Operating it
 
@@ -193,10 +225,10 @@ the connector does not take down the programs that were started through it.
 
 State on the host: `/var/lib/ssh-mcp/jobs` (background job logs, not pruned), `/var/lib/ssh-mcp/sessions` (one
 remembered working directory per `bash` session), `/var/lib/ssh-mcp/out` (full copies of oversized output, deleted
-after 3 days).
+after 3 days), `/var/lib/ssh-mcp/audit` (the audit log).
 
 For a careful upgrade of a busy server there is [`upgrade/deploy.sh`](upgrade/deploy.sh): it swaps in
-`/opt/ssh-mcp/server.new.ts`, checks the tool list, runs a real `batch` call and the bridge, and rolls back by itself.
+`/opt/ssh-mcp/server.new.ts`, checks the tool list, the audit log, a real `batch` call and the bridge, and rolls back by itself.
 [`upgrade/rehearse.sh`](upgrade/rehearse.sh) rehearses that on a throwaway copy of the service first.
 
 ## Security
@@ -221,13 +253,13 @@ Found a security problem? Please report it privately (GitHub: Security → Repor
 ```bash
 npm ci
 npm run typecheck
-npm test          # 115 black-box tests over the HTTP endpoint, against "local" and an in-process SSH server
+npm test          # 133 black-box tests over the HTTP endpoint, against "local" and an in-process SSH server
 ```
 
 The whole server is one file, [`server.ts`](server.ts), run with `tsx`; [`box.sh`](box.sh) is the bridge client the
 server hands out. Configuration is by environment variable: `MCP_SECRET` (required, 32+ characters), `PORT` (8787),
 `HOSTS_FILE` (`./hosts.json`), `JOBS_DIR` (`/var/lib/ssh-mcp/jobs`), `PUBLIC_URL` (only if the proxy does not send
-`X-Forwarded-Host`).
+`X-Forwarded-Host`), and the `AUDIT_*` settings above.
 
 ## License
 
