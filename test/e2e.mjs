@@ -36,7 +36,7 @@ const NEW = ["bash", "read", "write", "edit", "bridge"]; // v1.2
 const V13 = ["batch"]; // v1.3
 const V14 = ["audit"]; // v1.4
 const V15 = ["add_host"]; // v1.5
-const VERSION = "1.6.0";
+const VERSION = "1.6.1";
 const ALL_TOOLS = [...OLD, ...NEW, ...V13, ...V14, ...V15];
 const HOSTS = ["local", "remote"];
 const MAX_OUT = 100_000;
@@ -969,6 +969,55 @@ test("G10 a client that disconnects mid-download does not leave the transfer run
   for (let i = 0; i < 60 && pgrep(`tar -C ${dir}`); i++) await sleep(100);
   assert.equal(pgrep(`tar -C ${dir}`), "", "tar was stopped");
   assert.equal((await rpc(BASE, "tools/list")).status, 200); // and the server is fine
+});
+
+// One HTTP request over a bare socket that is closed the moment the announced body is complete. That is what curl
+// does; fetch keeps its connections open, so it never shows what a server does when the client leaves at once.
+function rawRequest(url, { method = "GET", body = "" } = {}) {
+  const u = new URL(url);
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(Number(u.port), u.hostname, () =>
+      sock.write(`${method} ${u.pathname}${u.search} HTTP/1.1\r\nHost: ${u.host}\r\nContent-Type: text/plain\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`));
+    let buf = Buffer.alloc(0);
+    sock.on("data", (d) => {
+      buf = Buffer.concat([buf, d]);
+      const at = buf.indexOf("\r\n\r\n");
+      if (at < 0) return;
+      const head = buf.subarray(0, at).toString("latin1"), len = Number((/^content-length: (\d+)$/im.exec(head) ?? [])[1]);
+      if (Number.isNaN(len) || buf.length - (at + 4) < len) return;
+      sock.destroy();
+      resolve({ status: Number(head.split(" ")[1]), body: buf.subarray(at + 4, at + 4 + len) });
+    });
+    sock.on("error", reject);
+    sock.on("close", () => reject(new Error("the connection closed before the whole response had arrived")));
+  });
+}
+
+test("G11 a client that closes the connection as soon as it has the whole response - as curl does - is not recorded as a broken transfer", async () => {
+  const br = BR ?? (await call("bridge", { ttl_hours: 1 })).text.match(/(http:\/\/127\.0\.0\.1:\d+\/b\/[0-9a-z]+\.[0-9a-f]{32})\/cli/)[1];
+  for (const host of HOSTS) {
+    const f = P(`g11-${host}.bin`), data = randomBytes(70_000);
+    writeFileSync(f, data);
+    for (let i = 0; i < 6; i++) {
+      const r = await rawRequest(`${br}/exec/${host}`, { method: "POST", body: `echo g11-${host}-${i}` });
+      assert.deepEqual([r.status, r.body.toString()], [200, `g11-${host}-${i}\n`]);
+      const g = await rawRequest(`${br}/fs/${host}?p64=${p64(f)}`);
+      assert.deepEqual([g.status, g.body.equals(data)], [200, true]);
+    }
+    const none = await rawRequest(`${br}/exec/${host}`, { method: "POST", body: ": g11-no-output" });
+    assert.deepEqual([none.status, none.body.length], [200, 0]);
+    // and with bodies large enough that the server has to wait for the client now and then
+    const big = P(`g11-${host}-big.bin`), bytes = randomBytes(6 * 1024 * 1024), sum = (b) => createHash("sha256").update(b).digest("hex");
+    writeFileSync(big, bytes);
+    const down = await rawRequest(`${br}/fs/${host}?p64=${p64(big)}`);
+    assert.deepEqual([down.status, down.body.length, sum(down.body)], [200, bytes.length, sum(bytes)]);
+    const out = await rawRequest(`${br}/exec/${host}`, { method: "POST", body: `echo g11-big >/dev/null; cat ${big}` });
+    assert.deepEqual([out.status, out.body.length, sum(out.body)], [200, bytes.length, sum(bytes)]);
+  }
+  const pick = (es) => es.filter((e) => (e.tool === "bridge.exec" && /^(echo|:) g11-/.test(e.what ?? "")) || (e.tool === "bridge.get" && /g11-/.test(e.what ?? "")));
+  const mine = await auditWhen(pick, (got) => got.length >= 30 && got.every((e) => e.done));
+  assert.equal(mine.length, 30);
+  assert.deepEqual(mine.filter((e) => !e.ok).map((e) => `${e.tool} ${e.what}: ${e.err}`), [], "each of them got its whole answer");
 });
 
 // ═════════════════════════ v1.3: fewer round trips - batch, quiet output, server instructions ═════════════════════════

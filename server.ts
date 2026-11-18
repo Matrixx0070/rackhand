@@ -23,7 +23,7 @@ const HOSTS_FILE = process.env.HOSTS_FILE ?? "./hosts.json";
 const MAX_OUT = 100_000;
 const JOBS_DIR = process.env.JOBS_DIR ?? "/var/lib/ssh-mcp/jobs"; // ssh_spawn: <jobId>.log / .exit / .pid / .cmd / .sh
 const MAX_PAYLOAD = 64 * 1024; // bytes of command/code sent inline (base64) in one shell argument
-const VERSION = "1.6.0";
+const VERSION = "1.6.1";
 // Sent to the client at initialize; clients put it in front of the model. Keep it short: it costs tokens in every conversation.
 const INSTRUCTIONS = `Remote shell and files on the hosts from list_hosts ("local" = the machine this connector runs on).
 Every tool call is a round trip, so do as much as possible per call:
@@ -1917,6 +1917,28 @@ bridge.get("/cli", guarded(async (req, res) => {
   }, same);
 }));
 
+// A response whose length was announced is finished the moment that many bytes have gone out, not when the script
+// that produced them has also exited: a client that closes as soon as it has everything (curl does) must not look
+// like one that broke off. Bytes written to the returned stream go to `res`; `complete` says the whole body went in.
+function sized(res: express.Response, size: number): Transform & { complete: boolean } {
+  let left = size;
+  const out = Object.assign(new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      if (out.complete) return cb();                                      // never more than was announced
+      const part = chunk.length > left ? chunk.subarray(0, left) : chunk;
+      left -= part.length;
+      if (part.length) this.push(part);
+      if (left === 0) { out.complete = true; this.push(null); }           // end of the body: the pipe ends `res` once all of it is written
+      cb();
+    },
+  }), { complete: false });
+  out.on("error", () => {});
+  res.once("close", () => { if (!res.writableFinished) out.destroy(); }); // the client left before it had everything: stop the script
+  out.pipe(res);
+  if (size === 0) { out.complete = true; out.push(null); }
+  return out;
+}
+
 // GET /fs/<host>?p64=<path>  ->  the file's bytes
 bridge.get("/fs/:host", guarded(async (req, res) => {
   const host = hostOf(req, res); if (!host) return;
@@ -1926,10 +1948,14 @@ bridge.get("/fs/:host", guarded(async (req, res) => {
     if (st.code !== 0) { plain(res, 404, `No such readable file: ${host}:${p}`); return { ok: false, err: "no such readable file" }; }
     const size = Number(st.stdout.trim());
     res.status(200).set({ "Content-Type": "application/octet-stream", "Content-Length": String(size) });
-    const r = await streamExec(host, `head -c ${size} -- ${shq(p)}`, null, res);
+    const out = sized(res, size);
+    const r = await streamExec(host, `head -c ${size} -- ${shq(p)}`, null, out);
     // on failure the client sees a broken transfer, never a silently short file
-    if (r.aborted || r.code !== 0) { res.destroy(); return { ok: false, err: r.aborted ? "the client disconnected" : `exit ${r.code}`, bytes: size }; }
-    res.end();
+    if (r.aborted || r.code !== 0 || !out.complete) {
+      res.destroy();
+      return { ok: false, err: r.aborted ? "the client disconnected" : r.code !== 0 ? `exit ${r.code}` : "the file became shorter while it was being sent", bytes: size };
+    }
+    out.end();
     return { ok: true, bytes: size };
   }, same);
 }));
@@ -2009,23 +2035,27 @@ bridge.post("/exec/:host", express.text({ type: () => true, limit: "1mb" }), gua
     try { tripCheck([{ command }], /^(1|true|yes)$/i.test(qstr(req.query.confirm) ?? ""), "?confirm=1 (box exec -y)"); }
     catch (e) { plain(res, 409, (e as Error).message); return { ok: false, err: (e as Error).message }; }
     // The script answers with one header line, "rc=<exit code> size=<bytes>", then the output itself.
-    let head: Buffer | null = Buffer.alloc(0), started = false, rc: number | null = null;
+    let head: Buffer | null = Buffer.alloc(0), started = false, rc: number | null = null, left = 0, complete = false;
+    // when the announced body has gone in, the response ends (the pipe ends `res` once all of it is written),
+    // whatever the script still does before it exits
+    const pass = (t: Transform, bytes: Buffer) => { if (complete) return; left -= bytes.length; if (bytes.length) t.push(bytes); if (left <= 0) { complete = true; t.push(null); } };
     const body = new Transform({
       transform(chunk: Buffer, _enc, cb) {
-        if (head === null) return cb(null, chunk);
+        if (head === null) { pass(this, chunk); return cb(); }
         head = Buffer.concat([head, chunk]);
         const nl = head.indexOf(10);
         const m = nl < 0 ? null : /^rc=(-?\d+) size=(\d+)$/.exec(head.subarray(0, nl).toString("latin1"));
         if (!m) return cb(nl < 0 && head.length < 64 ? null : new Error("unexpected output from the exec script"));
-        started = true; rc = Number(m[1]);
+        started = true; rc = Number(m[1]); left = Number(m[2]);
         res.status(200).set({ "Content-Type": "text/plain; charset=utf-8", "Content-Length": m[2], "X-Exit-Code": m[1] });
         const rest = head.subarray(nl + 1);
         head = null;
-        cb(null, rest);
+        pass(this, rest);
+        cb();
       },
     });
     body.on("error", () => {});
-    res.once("close", () => { if (!res.writableFinished) body.destroy(); }); // client gone: stop the script
+    res.once("close", () => { if (!res.writableFinished) body.destroy(); }); // the client left before it had everything: stop the script
     body.pipe(res);
     const r = await streamExec(host, bashScript({ command, timeoutSec: t, cwd, raw: true }), null, body);
     if (!started) {
