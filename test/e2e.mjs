@@ -9,7 +9,8 @@ import { promisify } from "node:util";
 import { appendFileSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, renameSync, existsSync, statSync, lstatSync, chmodSync,
   openSync, readSync, writeSync, fstatSync, fchmodSync, closeSync } from "node:fs";
 import { createHash, createHmac, randomBytes } from "node:crypto";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
+import net from "node:net";
 import path from "node:path";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
@@ -35,7 +36,7 @@ const NEW = ["bash", "read", "write", "edit", "bridge"]; // v1.2
 const V13 = ["batch"]; // v1.3
 const V14 = ["audit"]; // v1.4
 const V15 = ["add_host"]; // v1.5
-const VERSION = "1.5.1";
+const VERSION = "1.6.0";
 const ALL_TOOLS = [...OLD, ...NEW, ...V13, ...V14, ...V15];
 const HOSTS = ["local", "remote"];
 const MAX_OUT = 100_000;
@@ -185,6 +186,7 @@ after(() => {
   for (const p of servers) p.kill("SIGKILL");
   sshd.srv.close();
   sshd2.srv.close();
+  for (const s of realSshds) s.proc?.kill("SIGKILL");
   for (const n of ["31337", "31338", "41337", "41338", "51337", "51338", "61337", "61338", "71337", "71338"]) pkill9(`sleep ${n}`);
   rmSync(TMP, { recursive: true, force: true });
 });
@@ -1728,12 +1730,16 @@ test("H2 add_host: once the key is authorized the host is tested, its host key p
   assert.ok(r.text.includes(sshd2.fp));
   assert.match(r.text, /logged in as \S+ on \S+/);
   const hosts = JSON.parse(readFileSync(P("hosts.json"), "utf8"));
-  assert.deepEqual(hosts["web-1"], { host: "127.0.0.1", port: sshd2.port, username: "deploy", privateKeyPath: key, hostFingerprint: sshd2.fp });
+  const { pq, pqWhy, ...entry } = hosts["web-1"];
+  assert.deepEqual(entry, { host: "127.0.0.1", port: sshd2.port, username: "deploy", privateKeyPath: key, hostFingerprint: sshd2.fp });
+  assert.equal(pq, false, "this test server has no post-quantum key exchange, and the entry says so"); // v1.6
+  assert.match(pqWhy, /post-quantum/);
+  assert.match(r.text, /^Key exchange: classical\. Post-quantum was not possible: /m);
   assert.deepEqual([hosts.local, hosts.remote], [JSON.parse(before).local, JSON.parse(before).remote], "the other hosts are untouched");
   assert.equal(statSync(P("hosts.json")).mode & 0o777, 0o600);
   assert.equal(readFileSync(P("hosts.json.bak"), "utf8"), before, "the previous file is kept as hosts.json.bak");
   assert.equal((await call("ssh_exec", { host: "web-1", command: "echo via-new-host" })).text, "exit: 0\n--- stdout ---\nvia-new-host\n\n--- stderr ---\n");
-  assert.match((await call("list_hosts", {})).text, new RegExp(`^web-1: deploy@127\\.0\\.0\\.1:${sshd2.port}$`, "m"));
+  assert.match((await call("list_hosts", {})).text, new RegExp(`^web-1: deploy@127\\.0\\.0\\.1:${sshd2.port} \\(classical key exchange: [^()]*post-quantum[^()]*(\\([^()]*\\))?[^()]*\\)$`, "m"));
 });
 
 test("H3 add_host: refuses what it should - an existing name, a host key that is not the expected one, a host it cannot reach", async () => {
@@ -1822,4 +1828,306 @@ test("H6 add_host: a connector key that cannot be read is set aside and a new on
   assert.match((await call("add_host", { ...at, fingerprint: sshd2.fp }, base)).text, /^Added host "h6": deploy@/);
   assert.match((await call("ssh_exec", { host: "h6", command: "echo with-the-new-key" }, base)).text, /with-the-new-key/);
   assert.deepEqual(readdirSync(dir).filter((f) => f.startsWith("id_ed25519.unusable-")).sort(), aside, "a good key is left alone on later calls");
+});
+
+// ═════════════════════════ v1.6: post-quantum key exchange for remote hosts ═════════════════════════
+// The SSH library the connector uses has no post-quantum key exchange; the system's OpenSSH has. For a host
+// marked "pq": true the connection that crosses the network is made by OpenSSH (post-quantum key exchange only,
+// host key pinned) and does nothing but carry bytes to that server's own SSH port; the library's connection
+// runs inside it. These tests use a real sshd, because its log is the evidence for what was on the wire: hosts
+// are added by the address 127.0.0.2, the inner connection arrives on 127.0.0.1.
+const SSHD_BIN = ["/usr/sbin/sshd", "/usr/local/sbin/sshd", "/usr/bin/sshd", "/opt/homebrew/sbin/sshd"].find((f) => existsSync(f));
+const PQ_NAMES = ["mlkem768x25519-sha256", "mlkem768nistp256-sha256", "mlkem1024nistp384-sha384", "sntrup761x25519-sha512", "sntrup761x25519-sha512@openssh.com"];
+const PQ_HERE = (() => { try { return execFileSync("ssh", ["-Q", "kex"], { stdio: ["ignore", "pipe", "ignore"] }).toString().split("\n").filter((k) => PQ_NAMES.includes(k)); } catch { return []; } })();
+const NO_REAL = !SSHD_BIN ? "no sshd on this machine" : !PQ_HERE.length ? "the OpenSSH client on this machine has no post-quantum key exchange" : false;
+const ME = userInfo().username;
+const freePort = () => new Promise((res) => { const s = net.createServer(); s.listen(0, "127.0.0.1", () => { const port = s.address().port; s.close(() => res(port)); }); });
+const realSshds = [];
+let realA, realB;
+async function realSshd(options = {}) {
+  const dir = mkdtempSync(path.join(TMP, "sshd-")), port = await freePort(), keys = { a: keyPair(), b: keyPair() };
+  for (const [n, k] of Object.entries(keys)) writeFileSync(path.join(dir, `host-${n}`), k.private, { mode: 0o600 });
+  const fpOf = (k) => "SHA256:" + createHash("sha256").update(utils.parseKey(k.private).getPublicSSH()).digest("base64").replace(/=+$/, "");
+  const s = { dir, port, fp: fpOf(keys.a), authorized: path.join(dir, "authorized_keys"), log: path.join(dir, "sshd.log"), proc: null };
+  writeFileSync(s.authorized, "");
+  writeFileSync(s.log, "");
+  if (process.getuid?.() === 0) mkdirSync("/run/sshd", { recursive: true }); // sshd wants this directory when it runs as root
+  s.stop = async () => { const p = s.proc; if (!p) return; s.proc = null; const gone = new Promise((r) => p.once("exit", r)); p.kill("SIGTERM"); await gone; };
+  // (re)start it, on the same port: kex = the only key exchange it offers, forwarding = AllowTcpForwarding, hostKey = which of its
+  // two host keys, listen = the addresses it listens on
+  s.start = async ({ kex, forwarding = true, hostKey = "a", listen = ["127.0.0.1", "127.0.0.2"] } = {}) => {
+    await s.stop();
+    writeFileSync(path.join(dir, "sshd_config"), [`Port ${port}`, ...listen.map((a) => `ListenAddress ${a}`), `HostKey ${path.join(dir, `host-${hostKey}`)}`, "PidFile none",
+      `AuthorizedKeysFile ${s.authorized}`, "StrictModes no", "UsePAM no", "PasswordAuthentication no", "KbdInteractiveAuthentication no", "PermitRootLogin yes", "LogLevel DEBUG1",
+      "Subsystem sftp internal-sftp", `AllowTcpForwarding ${forwarding ? "yes" : "no"}`, ...(kex ? [`KexAlgorithms ${kex}`] : []), ""].join("\n"));
+    const from = s.mark(), fd = openSync(s.log, "a");
+    s.proc = spawn(SSHD_BIN, ["-D", "-e", "-f", path.join(dir, "sshd_config")], { stdio: ["ignore", fd, fd] });
+    closeSync(fd);
+    for (let i = 0; i < 100; i++) { if ((s.since(from).match(/Server listening on/g) ?? []).length >= listen.length) return s; await sleep(50); }
+    throw new Error(`sshd did not start:\n${s.since(from)}`);
+  };
+  s.mark = () => statSync(s.log).size;                            // a place in its log ...
+  s.since = (mark) => readFileSync(s.log).subarray(mark).toString(); // ... and what it logged after that
+  realSshds.push(s);
+  return s.start(options);
+}
+// What the server saw, one entry per connection in the order they came: the address it arrived on, the key
+// exchange it negotiated, whether a login was accepted on it, and whether it is one the server opened to itself
+// for a forwarding request (inner). (Only for calls made one after the other.)
+function wire(log) {
+  const seen = [];
+  let forwarding = false;
+  for (const line of log.split("\n")) {
+    if (/server_request_direct_tcpip/.test(line)) { forwarding = true; continue; }
+    const c = /^Connection from \S+ port \d+ on (\S+) port \d+/.exec(line);
+    if (c) { seen.push({ on: c[1], kex: null, login: false, tried: false, inner: forwarding }); forwarding = false; continue; }
+    const cur = seen[seen.length - 1];
+    if (!cur) continue;
+    const k = /kex: algorithm: (\S+)/.exec(line);
+    if (k && !cur.kex) cur.kex = k[1];
+    if (/^(Accepted|Failed|Postponed) publickey| userauth-request for user /.test(line)) cur.tried = true; // a login was at least attempted
+    if (/^Accepted publickey/.test(line)) cur.login = true;
+  }
+  return seen;
+}
+const isPq = (kex) => PQ_NAMES.includes(kex);
+const count = (text, re) => (text.match(re) ?? []).length;
+
+test("K1 add_host to a real OpenSSH server: the login, and everything after it, travels inside a post-quantum connection", { skip: NO_REAL }, async () => {
+  realA = await realSshd();
+  const at = { name: "pq-1", host: "127.0.0.2", port: realA.port, username: ME };
+  const first = await call("add_host", at);
+  assert.match(first.text, /^Not added yet: /, first.text);
+  assert.ok(first.text.includes(realA.fp), "the host key it must check is shown");
+  // already now: the one login that was tried (and refused, the key is not known there yet) went over a post-quantum key exchange
+  const tries = wire(realA.since(0)).filter((c) => c.tried);
+  assert.ok(tries.length >= 1 && tries.every((c) => isPq(c.kex) && !c.login), JSON.stringify(wire(realA.since(0))));
+  appendFileSync(realA.authorized, readFileSync(P("keys", "id_ed25519.pub"), "utf8"));
+
+  const mark = realA.mark();
+  const r = await call("add_host", { ...at, fingerprint: realA.fp });
+  assert.equal(r.isError, false, r.text);
+  assert.match(r.text, /^Added host "pq-1": /);
+  const kex = (/^Key exchange: (\S+) \(post-quantum\)/m.exec(r.text) ?? [])[1];
+  assert.ok(PQ_HERE.includes(kex), `the result names the key exchange that was negotiated: ${r.text}`);
+  assert.match(r.text, new RegExp(`logged in as ${ME} on \\S+`));
+  assert.deepEqual(JSON.parse(readFileSync(P("hosts.json"), "utf8"))["pq-1"],
+    { host: "127.0.0.2", port: realA.port, username: ME, privateKeyPath: P("keys", "id_ed25519"), hostFingerprint: realA.fp, pq: true });
+  assert.match((await call("list_hosts", {})).text, new RegExp(`^pq-1: ${ME}@127\\.0\\.0\\.2:${realA.port} \\(post-quantum key exchange\\)$`, "m"));
+  assert.equal((await call("bash", { host: "pq-1", command: "echo through-pq; id -un" })).text, `through-pq\n${ME}\n`);
+
+  // the server's own account of it
+  const seen = wire(realA.since(mark)), outside = seen.filter((c) => c.on === "127.0.0.2"), inside = seen.filter((c) => c.on === "127.0.0.1");
+  assert.ok(outside.filter((c) => c.login).length >= 2, `logins from outside: ${JSON.stringify(seen)}`);
+  assert.deepEqual(outside.filter((c) => c.login && !isPq(c.kex)), [], "no login from outside over a classical key exchange - not even add_host's own test");
+  assert.ok(outside.filter((c) => c.login).every((c) => c.kex === kex), "the key exchange add_host reported is the one the server used");
+  assert.ok(inside.length >= 2 && inside.every((c) => c.inner && c.login && !isPq(c.kex)), "the library's own connection is one the server opened to its own loopback address, inside the outer one");
+});
+
+test("K2 every kind of call works through it - commands, files, parallel commands, jobs, batches, the bridge - and all of it is post-quantum on the wire", { skip: NO_REAL }, async () => {
+  const host = "pq-1", d = P("k2"), f = path.join(d, "f.txt"), mark = realA.mark();
+  mkdirSync(d);
+  assert.match((await call("bash", { host, command: `cd ${d} && echo in-session`, session: "k2" })).text, /in-session/);
+  assert.match((await call("bash", { host, command: "pwd", session: "k2" })).text, new RegExp(`^${d}$`, "m"));
+  // (this sshd logs at debug level to its stderr, and a few of those lines end up in a session's stderr - a real one logs to syslog)
+  assert.match((await call("ssh_exec", { host, command: "echo out; echo err >&2; exit 3" })).text, /^exit: 3\n--- stdout ---\nout\n\n--- stderr ---\n(debug1: [^\n]*\n)*err\n$/);
+
+  assert.equal((await call("write", { host, file_path: f, content: "alpha\nbeta\n" })).isError, false);
+  assert.match((await call("read", { host, file_path: f })).text, /alpha[\s\S]*beta/);
+  assert.equal((await call("edit", { host, file_path: f, old_string: "beta", new_string: "gamma" })).isError, false);
+  assert.equal(readFileSync(f, "utf8"), "alpha\ngamma\n");
+  const g = path.join(d, "g.txt");
+  assert.equal((await call("sftp_write", { host, path: g, content: "héllo\n", mode: "0640" })).text, `Wrote 7 bytes to ${host}:${g}`);
+  assert.equal((await call("sftp_read", { host, path: g })).text, "héllo\n");
+  assert.match((await call("sftp_list", { host, path: d })).text, /g\.txt/);
+
+  const many = await call("ssh_exec_many", { host, commands: [1, 2, 3, 4, 5, 6, 7, 8].map((n) => ({ id: `c${n}`, command: `echo par-${n}` })) });
+  for (let n = 1; n <= 8; n++) assert.match(many.text, new RegExp(`par-${n}\\b`), many.text);
+  const { jobId } = await spawnJob(host, "sleep 0.3; echo job-done");
+  const waited = await job(host, jobId, "wait", { timeout_sec: 20 });
+  assert.match(waited.text, /^state: exited$/m, waited.text);
+  assert.match(waited.text, /job-done/);
+  const b = await call("batch", { host, ops: [{ write: { file_path: path.join(d, "b.txt"), content: "from-batch\n" } }, { bash: { command: `cat ${path.join(d, "b.txt")}` } }] });
+  assert.match(b.text, /from-batch[\s\S]*batch: 2 ok, 0 failed, 0 skipped/, b.text);
+
+  // the bridge: 3 MB of random bytes there and back, and a command with a lot of output
+  const br = BR ?? (await call("bridge", { ttl_hours: 1 })).text.match(/(http:\/\/127\.0\.0\.1:\d+\/b\/[0-9a-z]+\.[0-9a-f]{32})\/cli/)[1];
+  const data = randomBytes(3 * 1024 * 1024), remote = path.join(d, "blob.bin");
+  const put = await fetch(`${br}/fs/${host}?p64=${p64(remote)}`, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: data });
+  assert.equal(put.status, 200, await put.text());
+  const got = Buffer.from(await (await fetch(`${br}/fs/${host}?p64=${p64(remote)}`)).arrayBuffer());
+  assert.equal(createHash("sha256").update(got).digest("hex"), createHash("sha256").update(data).digest("hex"), "3 MB came back unchanged");
+  const big = await fetch(`${br}/exec/${host}`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: "head -c 2000000 /dev/zero | tr '\\0' k; exit 5" });
+  assert.deepEqual([big.status, big.headers.get("x-exit-code"), (await big.text()).length], [200, "5", 2000000]);
+  const slow = await call("bash", { host, command: "echo started; sleep 30", timeout: 2000 });
+  assert.match(slow.text, /started/);
+  assert.match(slow.text, /timed out|timeout/i, slow.text);
+
+  await sleep(300); // the last connections are logged as they close
+  const log = realA.since(mark), outside = count(log, /^Connection from \S+ port \d+ on 127\.0\.0\.2 port/gm), inside = count(log, /^Connection from \S+ port \d+ on 127\.0\.0\.1 port/gm);
+  const pq = count(log, new RegExp(`kex: algorithm: (${PQ_NAMES.map((n) => n.replace(/[.]/g, "\\.")).join("|")}) `, "g")), all = count(log, /kex: algorithm: \S+ /g);
+  assert.ok(outside >= 15, `connections from outside: ${outside}`);
+  assert.equal(pq, outside, "every connection that came in from outside negotiated a post-quantum key exchange");
+  assert.equal(all - pq, inside, "the only classical key exchanges are the inner connections, on the server's own loopback address");
+});
+
+test("K3 the host key is pinned on the outer connection too: another server at that address gets no login and runs nothing", { skip: NO_REAL }, async () => {
+  await realA.start({ hostKey: "b" });
+  const mark = realA.mark(), marker = P("k3-must-not-exist");
+  try {
+    for (const [name, args] of [["bash", { command: `touch ${marker}` }], ["ssh_exec", { command: `touch ${marker}` }], ["sftp_list", { path: "/" }]]) {
+      const r = await call(name, { host: "pq-1", ...args });
+      assert.equal(r.isError, true, `${name}: ${r.text}`);
+      assert.match(r.text, /host key/i, name);
+    }
+    assert.equal(existsSync(marker), false);
+    assert.deepEqual(wire(realA.since(mark)).filter((c) => c.login), [], "no login was accepted");
+  } finally { await realA.start(); }
+  assert.equal((await call("bash", { host: "pq-1", command: "echo back" })).text, "back\n");
+});
+
+test("K4 no silent downgrade: when post-quantum key exchange stops being possible, calls fail and say so - until the owner changes the host on purpose", { skip: NO_REAL }, async () => {
+  const file = P("hosts.json"), before = readFileSync(file, "utf8"), marker = P("k4-must-not-exist");
+  try {
+    await realA.start({ kex: "curve25519-sha256" }); // e.g. the server was reinstalled with an older or stripped-down SSH
+    let mark = realA.mark();
+    const r = await call("bash", { host: "pq-1", command: `touch ${marker}` });
+    assert.equal(r.isError, true, r.text);
+    assert.match(r.text, /post-quantum/i);
+    assert.match(r.text, /Nothing was run/);
+    assert.match(r.text, /"pq": false/, "it says how to make the host a classical one on purpose");
+    assert.deepEqual(wire(realA.since(mark)).filter((c) => c.login), [], "no login, classical or otherwise");
+
+    await realA.start({ forwarding: false });
+    const f = await call("ssh_exec", { host: "pq-1", command: `touch ${marker}` });
+    assert.equal(f.isError, true, f.text);
+    assert.match(f.text, /forwarding/i);
+    assert.match(f.text, /Nothing was run/);
+    assert.equal(existsSync(marker), false);
+
+    const hosts = JSON.parse(before);
+    hosts["pq-1"].pq = false;
+    writeFileSync(file, JSON.stringify(hosts, null, 2));
+    mark = realA.mark();
+    assert.equal((await call("bash", { host: "pq-1", command: "echo classical-now" })).text, "classical-now\n");
+    assert.ok(wire(realA.since(mark)).some((c) => c.on === "127.0.0.2" && c.login && !isPq(c.kex)), "now the login is over a classical key exchange, as asked");
+    assert.match((await call("list_hosts", {})).text, new RegExp(`^pq-1: ${ME}@127\\.0\\.0\\.2:${realA.port} \\(classical key exchange\\)$`, "m"));
+  } finally { writeFileSync(file, before); await realA.start(); }
+  assert.equal((await call("bash", { host: "pq-1", command: "echo pq-again" })).text, "pq-again\n");
+});
+
+test("K5 add_host says plainly when post-quantum is not possible, and why; the host is then added as a classical one", { skip: NO_REAL }, async () => {
+  realB = await realSshd({ kex: "curve25519-sha256" });
+  appendFileSync(realB.authorized, readFileSync(P("keys", "id_ed25519.pub"), "utf8"));
+  const at = { host: "127.0.0.2", port: realB.port, username: ME, fingerprint: realB.fp };
+  const saved = (name) => JSON.parse(readFileSync(P("hosts.json"), "utf8"))[name];
+
+  const old = await call("add_host", { name: "old-ssh", ...at });
+  assert.match(old.text, /^Added host "old-ssh": /, old.text);
+  assert.match(old.text, /^Key exchange: classical\. Post-quantum was not possible: .*no post-quantum key exchange/m);
+  assert.equal(saved("old-ssh").pq, false);
+  assert.match(saved("old-ssh").pqWhy, /no post-quantum key exchange/);
+  assert.equal((await call("bash", { host: "old-ssh", command: "echo ok-classical" })).text, "ok-classical\n");
+  assert.match((await call("list_hosts", {})).text, /^old-ssh: \S+ \(classical key exchange: .*no post-quantum key exchange.*\)$/m);
+
+  await realB.start({ forwarding: false });
+  const nofwd = await call("add_host", { name: "no-fwd", ...at });
+  assert.match(nofwd.text, /^Key exchange: classical\. Post-quantum was not possible: .*forwarding/m, nofwd.text);
+  assert.equal(saved("no-fwd").pq, false);
+
+  await realB.start(); // once the server allows it, adding the host again makes it post-quantum
+  const again = await call("add_host", { name: "no-fwd", ...at, replace: true });
+  assert.match(again.text, /^Key exchange: \S+ \(post-quantum\)/m, again.text);
+  assert.deepEqual([saved("no-fwd").pq, "pqWhy" in saved("no-fwd")], [true, false]);
+  assert.equal((await call("bash", { host: "no-fwd", command: "echo now-pq" })).text, "now-pq\n");
+});
+
+test("K6 PQ_SSH=require refuses every remote host that is not post-quantum; PQ_SSH=off turns the feature off", { skip: NO_REAL }, async () => {
+  const hosts = JSON.parse(readFileSync(P("hosts.json"), "utf8")), file = P("k6-hosts.json");
+  writeFileSync(file, JSON.stringify({ local: hosts.local, remote: hosts.remote, "pq-1": hosts["pq-1"], "old-ssh": hosts["old-ssh"] }));
+  const strict = `http://127.0.0.1:18796/mcp/${SECRET}`, off = `http://127.0.0.1:18797/mcp/${SECRET}`;
+  await startServer(18796, { HOSTS_FILE: file, PQ_SSH: "require" });
+  await startServer(18797, { HOSTS_FILE: file, PQ_SSH: "off" });
+
+  assert.equal((await call("bash", { host: "pq-1", command: "echo strict-ok" }, strict)).text, "strict-ok\n"); // a new process: it finds the pinned host key by itself
+  assert.match((await call("bash", { host: "local", command: "echo local-ok" }, strict)).text, /local-ok/);
+  await realB.start({ kex: "curve25519-sha256" });
+  for (const h of ["remote", "old-ssh"]) {
+    const r = await call("ssh_exec", { host: h, command: "true" }, strict);
+    assert.equal(r.isError, true, `${h}: ${r.text}`);
+    assert.match(r.text, /PQ_SSH=require/, h);
+  }
+  const no = await call("add_host", { name: "strict-no", host: "127.0.0.2", port: realB.port, username: ME, fingerprint: realB.fp }, strict);
+  assert.equal(no.isError, true, no.text);
+  assert.match(no.text, /PQ_SSH=require/);
+  assert.match(no.text, /Nothing was added/);
+  assert.equal("strict-no" in JSON.parse(readFileSync(file, "utf8")), false);
+
+  const mark = realA.mark();
+  assert.equal((await call("bash", { host: "pq-1", command: "echo off-ok" }, off)).text, "off-ok\n");
+  assert.ok(wire(realA.since(mark)).some((c) => c.on === "127.0.0.2" && c.login && !isPq(c.kex)), "with PQ_SSH=off the connection is the plain one");
+  assert.match((await call("list_hosts", {}, off)).text, /^pq-1: \S+ \(classical key exchange: PQ_SSH=off\)$/m);
+  await realB.start();
+  const added = await call("add_host", { name: "off-add", host: "127.0.0.2", port: realB.port, username: ME, fingerprint: realB.fp }, off);
+  assert.match(added.text, /^Key exchange: classical\. .*PQ_SSH=off/m, added.text);
+  assert.equal("pq" in JSON.parse(readFileSync(file, "utf8"))["off-add"], false, "nothing is decided about the host while the feature is off");
+});
+
+test("K7 a host written into hosts.json by hand becomes post-quantum with \"pq\": true - given a pinned host key and a key file without a passphrase", { skip: NO_REAL }, async () => {
+  const file = P("hosts.json"), before = readFileSync(file, "utf8"), hosts = JSON.parse(before);
+  const base = { host: "127.0.0.2", port: realA.port, username: ME, privateKeyPath: P("keys", "id_ed25519"), pq: true };
+  hosts["by-hand"] = { ...base, hostFingerprint: realA.fp };
+  hosts["no-pin"] = base;
+  hosts["with-pass"] = { ...base, hostFingerprint: realA.fp, passphraseEnv: "SOME_PASSPHRASE" };
+  writeFileSync(file, JSON.stringify(hosts, null, 2));
+  try {
+    const mark = realA.mark();
+    assert.equal((await call("bash", { host: "by-hand", command: "echo by-hand-ok" })).text, "by-hand-ok\n");
+    const seen = wire(realA.since(mark)).filter((c) => c.on === "127.0.0.2" && c.login);
+    assert.ok(seen.length === 1 && isPq(seen[0].kex), JSON.stringify(seen));
+    const pin = await call("bash", { host: "no-pin", command: "true" });
+    assert.deepEqual([pin.isError, /hostFingerprint/.test(pin.text)], [true, true], pin.text);
+    const pass = await call("bash", { host: "with-pass", command: "true" });
+    assert.deepEqual([pass.isError, /passphrase/.test(pass.text)], [true, true], pass.text);
+  } finally { writeFileSync(file, before); }
+});
+
+test("K8 where the server's own SSH is not at its loopback address and that port - a port mapping, an SSH server bound to one address - add_host asks the server", { skip: NO_REAL }, async () => {
+  const saved = (name) => JSON.parse(readFileSync(P("hosts.json"), "utf8"))[name];
+  // a "router": port q on 127.0.0.2 leads to the SSH server, which itself listens on another port
+  await realB.start();
+  const router = net.createServer((a) => { const b = net.connect(realB.port, "127.0.0.1"); a.pipe(b); b.pipe(a); a.on("error", () => b.destroy()); b.on("error", () => a.destroy()); });
+  await new Promise((res) => router.listen(0, "127.0.0.2", res));
+  const q = router.address().port;
+  try {
+    const r = await call("add_host", { name: "mapped", host: "127.0.0.2", port: q, username: ME, fingerprint: realB.fp });
+    assert.match(r.text, /^Key exchange: \S+ \(post-quantum\)/m, r.text);
+    assert.deepEqual([saved("mapped").pq, saved("mapped").port, saved("mapped").pqVia], [true, q, `127.0.0.1:${realB.port}`]);
+    assert.equal((await call("bash", { host: "mapped", command: "echo through-the-mapping" })).text, "through-the-mapping\n");
+  } finally { router.close(); }
+
+  // an SSH server that does not listen on the loopback address at all
+  await realB.start({ listen: ["127.0.0.2"] });
+  const mark = realB.mark();
+  const one = await call("add_host", { name: "one-address", host: "127.0.0.2", port: realB.port, username: ME, fingerprint: realB.fp });
+  assert.match(one.text, /^Key exchange: \S+ \(post-quantum\)/m, one.text);
+  assert.deepEqual([saved("one-address").pq, saved("one-address").pqVia], [true, `127.0.0.2:${realB.port}`]);
+  assert.equal((await call("bash", { host: "one-address", command: "echo one-address-ok" })).text, "one-address-ok\n");
+  const seen = wire(realB.since(mark));
+  assert.ok(seen.filter((c) => c.login && isPq(c.kex) && !c.inner).length >= 2, JSON.stringify(seen));
+  assert.deepEqual(seen.filter((c) => c.login && !isPq(c.kex) && !c.inner), [], "still no login from outside over a classical key exchange");
+  await realB.start();
+});
+
+test("K9 the audit log records the key exchange of each call, and no helper process is left behind", { skip: NO_REAL }, async () => {
+  const es = auditEntries().filter((e) => e.host === "pq-1" && e.done);
+  const through = es.find((e) => e.what === "echo through-pq; id -un");
+  assert.ok(through && PQ_HERE.includes(through.kex), JSON.stringify(through));
+  assert.equal(es.find((e) => e.what === "echo classical-now").kex, undefined, "a classical call has no such mark");
+  assert.ok(es.filter((e) => e.ok && e.kex).length >= 10);
+  const shown = (await call("audit", { contains: "through-pq", limit: 5 })).text;
+  assert.match(shown, /  bash  pq-1 \(pq\)  ok  /, shown);
+  let left = "";
+  for (let i = 0; i < 50; i++) { left = pgrep("HostKeyAlias=sshmcp-"); if (!left) break; await sleep(100); }
+  assert.equal(left, "", "OpenSSH helper processes still running");
 });

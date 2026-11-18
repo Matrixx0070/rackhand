@@ -16,7 +16,7 @@ ssh-mcp on your VPS ──SSH/SFTP──▶ any host in hosts.json
 > On AWS EC2, anyone with the URL can also use the instance's IAM role - check what that role allows
 > before you install (see [Security](#security)).
 
-18 tools, one install command, no account, no database. Version 1.5.1.
+18 tools, one install command, no account, no database. Version 1.6.0.
 
 ## Quick start
 
@@ -176,6 +176,7 @@ Ask the assistant: *"add my server 203.0.113.10 as web-1, user deploy"*. That is
 ```
 Added host "web-1": deploy@203.0.113.10:22
 Host key pinned: SHA256:... (ssh-ed25519)
+Key exchange: mlkem768x25519-sha256 (post-quantum) - the connection is made by this machine's OpenSSH client, everything else runs inside it
 Test: logged in as deploy on web-1
 ```
 
@@ -202,6 +203,45 @@ ssh-keyscan -t ed25519 203.0.113.10 2>/dev/null | ssh-keygen -lf -  # -> SHA256:
 
 Use keys. If a key has a passphrase, put it in an environment variable in `/etc/ssh-mcp.env` and name that variable
 in `passphraseEnv`; never put a secret in `hosts.json` itself.
+
+### Post-quantum key exchange
+
+Traffic that is recorded today can be decrypted later by whoever gets a large enough quantum computer, unless the
+key exchange that protected it was a post-quantum one. For the hosts it reaches over SSH, ssh-mcp uses one wherever
+the server has it:
+
+- `add_host` first tries a connection made by this machine's **OpenSSH client**, restricted to the post-quantum key
+  exchanges (`mlkem768x25519-sha256` from OpenSSH 9.9, `sntrup761x25519-sha512` from 9.0) and to the pinned host
+  key. That connection only carries bytes to the server's own SSH port; the connector's commands, files and jobs
+  run inside it. So no login and no data crosses the network under a classical key exchange, not even the first
+  login. (The one thing that does is the first look at the server's host key, which is public.)
+- The result says which it is, and the host is saved with `"pq": true`. `list_hosts` shows
+  `(post-quantum key exchange)`, and the audit log marks each such call with `(pq)` and records the algorithm (`kex`).
+- **No silent downgrade.** A host added this way never falls back to a classical connection by itself. If the
+  server later stops offering post-quantum key exchange, or forwarding is switched off, calls fail and say why,
+  until you decide: `"pq": false` for that host in `hosts.json`, or `add_host` again with `replace: true`.
+- When post-quantum is not possible, `add_host` says why and adds the host as a classical one (`"pq": false`):
+  the server's SSH is older than OpenSSH 9.0, it does not allow TCP forwarding for that login
+  (`AllowTcpForwarding`, or `no-port-forwarding` on the key), or this machine has no OpenSSH client that can do it.
+- For a host you wrote into `hosts.json` yourself, add `"pq": true`. It needs `hostFingerprint` and a
+  `privateKeyPath` without a passphrase. Hosts without the setting are connected to as before.
+- Behind a port mapping (a container, a router), or when the server's SSH listens on one address only, `add_host`
+  asks the server where its own SSH is and saves that as `pqVia`.
+- `PQ_SSH=require` in `/etc/ssh-mcp.env` refuses every remote host that is not post-quantum, and `add_host` then
+  adds nothing else. `PQ_SSH=off` turns the feature off.
+
+What it costs: one more SSH handshake per call. Measured with client and server on one machine: about 0.2 s with
+OpenSSH 9.6 (sntrup761), nothing measurable with OpenSSH 10.2 (ML-KEM).
+
+What it does not cover:
+
+- **The other leg.** Between your AI client and this server the protection is TLS. Caddy offers a post-quantum key
+  exchange there (X25519MLKEM768) and uses it when the client asks for it; whether the client asks is the
+  client's choice, and this server cannot force it.
+- **Someone in the path while a host is added** can make a server look as if it had no post-quantum key exchange.
+  The host is then added as a classical one, and the result says so; `PQ_SSH=require` refuses instead.
+- Only the key exchange is post-quantum. Host keys and login keys are the usual ones: breaking those lets an
+  attacker impersonate a server in the future, not read what was recorded in the past.
 
 ## The bridge and the `box` command
 
@@ -244,7 +284,8 @@ $ tail -f /var/lib/ssh-mcp/audit/audit.jsonl | jq -c .
 - **Who:** `ip` is the address your reverse proxy saw, `ua` the client's user agent, `via` is `mcp` (the connector
   URL) or `bridge`; `tok` ties a bridge request to the `bridge` call that created its URL.
 - **What:** for commands the command itself; for file tools the paths and sizes. **File contents are never logged.**
-  Each step of a `batch` has its own entry (`batch: "<id>#2/4"`).
+  Each step of a `batch` has its own entry (`batch: "<id>#2/4"`). A call that reached its host over a
+  [post-quantum key exchange](#post-quantum-key-exchange) has `kex` in its result line.
 - **Masking:** values that look like credentials (`password=...`, `--token ...`, `Authorization: Bearer ...`, private
   keys, the connector's own secret and bridge tokens) are replaced with `***` before anything is written, and long
   commands are cut to 2000 characters. This is best effort: do not rely on it to keep secrets out of the log.
@@ -288,6 +329,9 @@ back by itself.
 - The server binds to `127.0.0.1`; the reverse proxy is the only public entry, and only over HTTPS.
 - Every host in `hosts.json` is fully reachable by anything that can call the connector. Keep the list short and
   prefer a non-root `username` on the targets.
+- Connections to those hosts use [post-quantum key exchange](#post-quantum-key-exchange) where the server has it,
+  and a host added that way does not fall back. The leg from the AI client to this server is TLS, and how strong
+  that is against a future quantum computer depends on the client.
 - **Cloud credentials on the machine are in reach too.** On AWS EC2 the instance's IAM role can be used by anyone
   with a shell, so anyone with the URL has that role's permissions. The installer prints a warning when it finds a
   role. Give the instance no role, or one with only the permissions the machine itself needs.
@@ -304,13 +348,17 @@ Found a security problem? Please report it privately (GitHub: Security → Repor
 ```bash
 npm ci
 npm run typecheck
-npm test          # 144 black-box tests over the HTTP endpoint, against "local" and an in-process SSH server
+npm test          # 153 black-box tests over the HTTP endpoint, against "local", an in-process SSH server and a real sshd
 ```
 
 The whole server is one file, [`server.ts`](server.ts), run with `tsx`; [`box.sh`](box.sh) is the bridge client the
 server hands out. Configuration is by environment variable: `MCP_SECRET` (required, 32+ characters), `PORT` (8787),
 `HOSTS_FILE` (`./hosts.json`), `JOBS_DIR` (`/var/lib/ssh-mcp/jobs`), `PUBLIC_URL` (only if the proxy does not send
-`X-Forwarded-Host`), the `AUDIT_*` settings above and `TRIPWIRE=off`.
+`X-Forwarded-Host`), the `AUDIT_*` settings above, `TRIPWIRE=off` and `PQ_SSH` (`off` or `require`).
+
+The nine post-quantum tests start a private `sshd` on a loopback port and read its log, so they need the OpenSSH
+server and a client with a post-quantum key exchange (`apt-get install openssh-server openssh-client`); without
+them they are skipped and say so.
 
 ## License
 

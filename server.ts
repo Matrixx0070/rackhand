@@ -5,13 +5,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { Client, type ConnectConfig, type ParsedKey } from "ssh2";
-import { exec, spawn } from "node:child_process";
+import { exec, execFile, spawn } from "node:child_process";
 import { readFileSync, promises as fs } from "node:fs";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { homedir, hostname } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
-import { PassThrough, Transform, type Readable, type Writable } from "node:stream";
+import { Duplex, PassThrough, Transform, type Readable, type Writable } from "node:stream";
 import { createRequire } from "node:module";
 
 // ssh2 is CommonJS and Node cannot see its `utils` as a named export, so it is taken from the module object.
@@ -23,7 +23,7 @@ const HOSTS_FILE = process.env.HOSTS_FILE ?? "./hosts.json";
 const MAX_OUT = 100_000;
 const JOBS_DIR = process.env.JOBS_DIR ?? "/var/lib/ssh-mcp/jobs"; // ssh_spawn: <jobId>.log / .exit / .pid / .cmd / .sh
 const MAX_PAYLOAD = 64 * 1024; // bytes of command/code sent inline (base64) in one shell argument
-const VERSION = "1.5.1";
+const VERSION = "1.6.0";
 // Sent to the client at initialize; clients put it in front of the model. Keep it short: it costs tokens in every conversation.
 const INSTRUCTIONS = `Remote shell and files on the hosts from list_hosts ("local" = the machine this connector runs on).
 Every tool call is a round trip, so do as much as possible per call:
@@ -48,6 +48,9 @@ type HostCfg = {
   passphraseEnv?: string;
   passwordEnv?: string;
   hostFingerprint?: string; // "SHA256:..." from ssh-keygen -lf
+  pq?: boolean;             // v1.6: true = post-quantum key exchange on the wire (see below); false = add_host found it impossible
+  pqWhy?: string;           //       ... and why
+  pqVia?: string;           //       where that server's SSH is as the server itself sees it ("ip:port"), when it is not 127.0.0.1:<port>
 };
 
 const loadHosts = (): Record<string, HostCfg> => JSON.parse(readFileSync(HOSTS_FILE, "utf8"));
@@ -59,7 +62,199 @@ function getHost(name: string): HostCfg {
   return cfg;
 }
 
-function connect(cfg: HostCfg): Promise<Client> {
+// ── v1.6: post-quantum key exchange for remote hosts ────────────────────────────────────────────
+// ssh2, the SSH library used here, has no post-quantum key exchange; OpenSSH has had one since 9.0. So for a host
+// marked "pq": true the connection that crosses the network is made by this machine's `ssh`: key exchange
+// restricted to the post-quantum ones, host key pinned, and all it does is carry bytes to that server's own SSH
+// port (ssh -W). The ssh2 connection - commands, SFTP, everything - runs inside it, so whatever is recorded on the
+// wire is protected by the outer key exchange. add_host decides this per host and writes it down; a host that was
+// added as post-quantum never falls back to a classical connection by itself.
+//   PQ_SSH=off      never do this: every host is connected to as in 1.5
+//   PQ_SSH=require  refuse every remote host that is not post-quantum
+const PQ_MODE: "auto" | "off" | "require" = /^(off|0|false|no)$/i.test(process.env.PQ_SSH ?? "") ? "off" : /^(require|required|only)$/i.test(process.env.PQ_SSH ?? "") ? "require" : "auto";
+const PQ_KEX = ["mlkem768x25519-sha256", "mlkem768nistp256-sha256", "mlkem1024nistp384-sha384", "sntrup761x25519-sha512", "sntrup761x25519-sha512@openssh.com"]; // best first
+type HostKey = { fp: string; type: string; blob: Buffer };
+type PqFail = { pqFail: true; kind: "nossh" | "nokex" | "forward" | "noroute" | "hostkey" | "innerkey" | "auth" | "down" | "other"; why: string };
+type Carried = { client: Client; kex: string };
+const pqFail = (kind: PqFail["kind"], why: string): PqFail => ({ pqFail: true, kind, why });
+const isPqFail = (e: unknown): e is PqFail => typeof e === "object" && e !== null && (e as PqFail).pqFail === true;
+const fingerprintOf = (key: Buffer) => `SHA256:${createHash("sha256").update(key).digest("base64").replace(/=+$/, "")}`;
+const samePin = (fp: string) => `SHA256:${fp.replace(/^SHA256:/, "").replace(/=+$/, "")}`;
+const keyTypeOf = (key: Buffer) => { const n = key.length >= 4 ? key.readUInt32BE(0) : 0; return n > 0 && n < 64 && key.length >= 4 + n ? key.subarray(4, 4 + n).toString("latin1") : "unknown"; };
+
+// The post-quantum key exchanges this machine's OpenSSH client knows: [] when it has none, or there is no client.
+let pqClient: Promise<string[]> | null = null;
+const pqHere = (): Promise<string[]> => (pqClient ??= new Promise<string[]>((res) => execFile("ssh", ["-Q", "kex"], { timeout: 10_000 }, (err, out) => {
+  const have = err ? [] : String(out).split("\n").map((l) => l.trim()), list = PQ_KEX.filter((k) => have.includes(k));
+  if (!list.length) pqClient = null; // ask again next time: a client can be installed later
+  res(list);
+})));
+
+// The host key a server presents, and nothing else: the connection is dropped before any login is tried.
+function presentedKey(host: string, port: number, username: string): Promise<HostKey | { err: string }> {
+  return new Promise((done) => {
+    const c = new Client();
+    let got: HostKey | undefined, settled = false;
+    const finish = (r: HostKey | { err: string }) => { if (settled) return; settled = true; clearTimeout(timer); c.destroy(); done(r); };
+    const timer = setTimeout(() => finish(got ?? { err: "timed out after 20 s" }), 20_000);
+    c.on("error", (e: Error) => finish(got ?? { err: e.message }));
+    c.on("close", () => finish(got ?? { err: "the connection was closed" }));
+    c.connect({
+      host, port, username, readyTimeout: 15_000,
+      hostVerifier: (key: Buffer) => { got = { fp: fingerprintOf(key), type: keyTypeOf(key), blob: Buffer.from(key) }; setImmediate(() => finish(got!)); return false; },
+    });
+  });
+}
+// The full host key behind a pinned fingerprint: OpenSSH's known_hosts needs the key itself. It is asked from the
+// server once per start and checked against the pin (add_host puts it here directly).
+const pqKeys = new Map<string, HostKey>();
+const pqKeyId = (host: string, port: number, fp: string) => `${host}:${port}:${samePin(fp)}`;
+async function pinnedKey(cfg: HostCfg): Promise<HostKey> {
+  const port = cfg.port ?? 22, id = pqKeyId(cfg.host!, port, cfg.hostFingerprint!), known = pqKeys.get(id);
+  if (known) return known;
+  const got = await presentedKey(cfg.host!, port, cfg.username ?? "");
+  if ("err" in got) throw pqFail("down", got.err);
+  if (got.fp !== samePin(cfg.hostFingerprint!)) throw pqFail("hostkey", "");
+  pqKeys.set(id, got);
+  return got;
+}
+async function knownHosts(alias: string, key: HostKey): Promise<string> {
+  let last: unknown;
+  for (const dir of [join(dirname(JOBS_DIR), "pq"), join(homedir(), ".ssh-mcp", "pq")]) {
+    try {
+      const file = join(dir, alias), line = `${alias} ${key.type} ${key.blob.toString("base64")}\n`;
+      if ((await fs.readFile(file, "utf8").catch(() => "")) === line) return file;
+      await mkdirp(dir);
+      await fs.chmod(dir, 0o700);
+      const tmp = `${file}.${randomBytes(4).toString("hex")}.tmp`;
+      await fs.writeFile(tmp, line, { mode: 0o600 });
+      await fs.rename(tmp, file);
+      return file;
+    } catch (e) { last = e; }
+  }
+  throw new Error(`cannot write the known-hosts file for the post-quantum connection: ${(last as Error).message}`);
+}
+// At most three connections to one server are being set up at a time: each is, for a moment, two connections that
+// have not logged in yet, and sshd starts dropping those at ten (MaxStartups).
+const pqGates = new Map<string, { busy: number; waiting: (() => void)[] }>();
+async function pqGate<T>(id: string, fn: () => Promise<T>): Promise<T> {
+  const g = pqGates.get(id) ?? { busy: 0, waiting: [] };
+  pqGates.set(id, g);
+  if (g.busy >= 3) await new Promise<void>((go) => g.waiting.push(go)); else g.busy++;
+  try { return await fn(); } finally { const next = g.waiting.shift(); if (next) next(); else if (--g.busy === 0) pqGates.delete(id); }
+}
+// Why the outer connection did not come up, from what the OpenSSH client said as it stopped.
+function pqFailure(log: string, inner: (Error & { level?: string }) | null, spawnErr: NodeJS.ErrnoException | null, via: string): PqFail {
+  const said = log.split("\n").map((l) => l.trim()).filter((l) => l && !/^(debug1:|Authenticated to |Warning: Permanently added )/.test(l)), last = said[said.length - 1] ?? "";
+  if (spawnErr) return pqFail("nossh", "this machine has no OpenSSH client with post-quantum key exchange");
+  if (/Host key for .* has changed|Host key verification failed|No \S+ host key is known/.test(log)) return pqFail("hostkey", "");
+  if (/no matching key exchange method found/.test(log)) return pqFail("nokex", "that server's SSH offers no post-quantum key exchange; OpenSSH 9.0 and newer do");
+  if (/open failed: administratively prohibited/.test(log)) return pqFail("forward", "that server does not allow TCP forwarding for this login: AllowTcpForwarding, or an option on the key");
+  if (/open failed: connect failed/.test(log)) return pqFail("noroute", `that server's SSH cannot be reached at ${via} from the server itself`);
+  if (/Permission denied \(/.test(log)) return /bad permissions|are too open/.test(log) ? pqFail("other", "OpenSSH refuses the key file: its permissions are too open") : pqFail("auth", "the server refused the login made by the OpenSSH client");
+  if (inner?.level === "client-authentication") return pqFail("auth", "the server refused the login");
+  // the outer connection is fine, but what it was led to is not the pinned server: on that machine, another SSH server has this port
+  if (inner && /verification failed|Host denied/i.test(inner.message)) return pqFail("innerkey", `what answers at ${via} on that server is another SSH server`);
+  if (/^ssh: connect to host |Could not resolve hostname|timed out|Connection reset by peer|kex_exchange_identification|Connection closed by remote host/m.test(said.join("\n"))) return pqFail("down", last);
+  return pqFail("other", (last || inner?.message || "the OpenSSH client stopped").slice(0, 300));
+}
+// The outer connection, as OpenSSH is told to make it: nothing from any ssh_config, this key only, the pinned host
+// key only, post-quantum key exchange only.
+type PqTarget = { host: string; port: number; username: string; keyPath: string; key: HostKey; kex: string[] };
+const pqEnv = () => ({ PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", HOME: homedir(), LC_ALL: "C" });
+async function pqArgs(o: PqTarget, logLevel: string): Promise<string[]> {
+  const algos = o.key.type === "ssh-ed25519" || /^ecdsa-sha2-nistp(256|384|521)$/.test(o.key.type) ? o.key.type : o.key.type === "ssh-rsa" ? "rsa-sha2-512,rsa-sha2-256" : "";
+  if (!algos) throw pqFail("other", `its host key is of a kind (${o.key.type}) this connection does not handle`);
+  const alias = `sshmcp-${createHash("sha256").update(pqKeyId(o.host, o.port, o.key.fp)).digest("hex").slice(0, 16)}`, kh = await knownHosts(alias, o.key);
+  const lit = (path: string) => path.replace(/%/g, "%%"); // OpenSSH expands %-tokens in file names
+  const file = /\s/.test(kh) ? `"${lit(kh)}"` : lit(kh);
+  return ["-F", "none", "-i", lit(o.keyPath), "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", "BatchMode=yes", "-o", "PreferredAuthentications=publickey",
+    "-o", "StrictHostKeyChecking=yes", "-o", `UserKnownHostsFile=${file}`, "-o", `GlobalKnownHostsFile=${file}`, "-o", `HostKeyAlias=${alias}`, "-o", `HostKeyAlgorithms=${algos}`,
+    "-o", `KexAlgorithms=${o.kex.join(",")}`, "-o", "UpdateHostKeys=no", "-o", "CheckHostIP=no", "-o", "ControlPath=none", "-o", "ConnectTimeout=15",
+    "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", `LogLevel=${logLevel}`, "-p", String(o.port), "-l", o.username];
+}
+// Behind a port mapping (a container, a router) or with an SSH server bound to one address, the server's SSH is
+// not at 127.0.0.1:<the port we connect to> as seen from the server. The server knows where it accepted us: asked
+// over a post-quantum connection of its own, it answers "ip:port" - or null when it cannot be asked.
+async function ownSshAddress(o: PqTarget): Promise<string | null> {
+  try {
+    const args = [...await pqArgs(o, "ERROR"), "-T", "--", o.host, 'echo "$SSH_CONNECTION"'];
+    const out = await new Promise<string>((res) => { const ch = execFile("ssh", args, { timeout: 25_000, env: pqEnv() }, (_e, stdout) => res(String(stdout ?? ""))); ch.stdin?.end(); });
+    const [, , ip, port] = out.trim().split(/\s+/);
+    if (!ip || !/^[0-9A-Fa-f:.]{2,45}$/.test(ip) || !/^\d{1,5}$/.test(port ?? "") || Number(port) < 1 || Number(port) > 65535) return null;
+    return ip.includes(":") ? `[${ip}]:${port}` : `${ip}:${port}`;
+  } catch { return null; }
+}
+// One connection with post-quantum key exchange on the wire: `ssh -W` as the carrier, the ssh2 client inside it.
+// `via` is where the server's own SSH is, as seen from the server. Resolves when the inner client is ready;
+// rejects with a PqFail.
+function carried(o: PqTarget & { via: string; privateKey: Buffer }): Promise<Carried> {
+  return pqArgs(o, "DEBUG1").then((args) => new Promise<Carried>((resolve, reject) => {
+    let child: ReturnType<typeof spawn>;
+    try { child = spawn("ssh", [...args, "-W", o.via, "--", o.host], { stdio: ["pipe", "pipe", "pipe"], env: pqEnv() }); }
+    catch { return reject(pqFail("nossh", "this machine's OpenSSH client could not be started")); }
+    const [stdin, stdout, stderr] = [child.stdin!, child.stdout!, child.stderr!];
+    let log = "", settled = false, closed = false, spawnErr: NodeJS.ErrnoException | null = null;
+    stderr.on("data", (d: Buffer) => { log = (log + d).slice(-65536); });
+    child.on("error", (e: NodeJS.ErrnoException) => { spawnErr = e; closed = true; });
+    child.on("close", () => { closed = true; });
+    stdin.on("error", () => {});
+    stdout.on("error", () => {});
+    const sock = Duplex.from({ readable: stdout, writable: stdin });
+    sock.on("error", () => {});
+    const c = new Client();
+    const fail = (inner: (Error & { level?: string }) | null) => {
+      if (settled) return;
+      settled = true;
+      c.destroy();
+      const done = () => { clearTimeout(wait); child.kill("SIGKILL"); reject(pqFailure(log, inner, spawnErr, o.via)); };
+      const wait = setTimeout(done, 3000); // the reason is in what OpenSSH says as it stops: give it a moment to say it
+      if (closed) done(); else { child.once("close", done); child.once("error", done); }
+    };
+    // The inner client is ready. Believe it only if OpenSSH itself reported a post-quantum key exchange for the outer one.
+    const ready = (tries: number) => {
+      const kex = /^debug1: kex: algorithm: (\S+)/m.exec(log)?.[1] ?? "";
+      if (!kex && tries > 0) return void setTimeout(() => ready(tries - 1), 50); // its report can be a moment behind
+      if (!PQ_KEX.includes(kex)) return fail(new Error(`the outer connection reported the key exchange "${kex || "?"}", which is not a post-quantum one`));
+      if (settled) return;
+      settled = true;
+      c.on("close", () => child.kill());
+      resolve({ client: c, kex });
+    };
+    c.on("ready", () => ready(10));
+    c.on("error", (e: Error & { level?: string }) => fail(e));
+    c.on("close", () => fail(null));
+    c.connect({ sock, username: o.username, privateKey: o.privateKey, readyTimeout: 20_000, keepaliveInterval: 10_000, hostVerifier: (key: Buffer) => fingerprintOf(key) === o.key.fp });
+  }));
+}
+async function carriedTo(cfg: HostCfg, label: string): Promise<Carried> {
+  if (!cfg.hostFingerprint) throw new Error(`"${label}" has "pq": true but no hostFingerprint: a post-quantum connection needs the host key to be pinned.`);
+  if (!cfg.privateKeyPath || cfg.passphraseEnv || cfg.passwordEnv) throw new Error(`"${label}" has "pq": true, which needs privateKeyPath to be a key file without a passphrase (no passphraseEnv, no passwordEnv).`);
+  const kex = await pqHere();
+  if (!kex.length) throw pqFail("nossh", "this machine has no OpenSSH client with post-quantum key exchange");
+  const key = await pinnedKey(cfg), port = cfg.port ?? 22, privateKey = readFileSync(cfg.privateKeyPath);
+  return pqGate(`${cfg.host}:${port}`, () => carried({ host: cfg.host!, port, via: cfg.pqVia ?? `127.0.0.1:${port}`, username: cfg.username ?? "", keyPath: cfg.privateKeyPath!, privateKey, key, kex }));
+}
+function pqError(label: string, cfg: HostCfg, f: PqFail): Error {
+  const at = `${cfg.host}:${cfg.port ?? 22}`;
+  if (f.kind === "hostkey") return new Error(`The host key of ${at} is not the pinned one (${cfg.hostFingerprint}): host key verification failed. Nothing was run.`);
+  if (f.kind === "innerkey") return new Error(`${at}: ${f.why}, not the pinned one (${cfg.hostFingerprint}): host key verification failed. Nothing was run.`);
+  if (f.kind === "down") return new Error(`Cannot reach ${at} over SSH: ${f.why}`);
+  if (f.kind === "auth") return new Error(`${at} did not accept the key for ${cfg.username}: ${f.why}. Nothing was run.`);
+  return new Error(`"${label}" is a post-quantum host, and a post-quantum connection to it is not possible right now: ${f.why}. Nothing was run. ` +
+    `It does not fall back by itself. If the change is lasting and a classical key exchange is acceptable for this host, set "pq": false for it in ${resolvePath(HOSTS_FILE)} or add it again with add_host (replace: true).`);
+}
+
+async function connect(cfg: HostCfg, name = ""): Promise<Client> {
+  const label = name || String(cfg.host);
+  if (cfg.pq === true && PQ_MODE !== "off") {
+    try {
+      const { client, kex } = await carriedTo(cfg, label);
+      auditNote({ kex });
+      return client;
+    } catch (e) { throw isPqFail(e) ? pqError(label, cfg, e) : e; }
+  }
+  if (PQ_MODE === "require") throw new Error(`"${label}" is not a post-quantum host, and this connector only connects to hosts that are (PQ_SSH=require). Add it again with add_host (replace: true): that tries post-quantum key exchange first.`);
   const opts: ConnectConfig = {
     host: cfg.host,
     port: cfg.port ?? 22,
@@ -91,7 +286,7 @@ async function runCommand(name: string, command: string, timeoutSec: number): Pr
         (err, stdout, stderr) => resolve({ code: err ? (typeof err.code === "number" ? err.code : 1) : 0, stdout, stderr }));
     });
   }
-  const conn = await connect(cfg);
+  const conn = await connect(cfg, name);
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => { conn.end(); reject(new Error(`Timed out after ${timeoutSec}s`)); }, timeoutSec * 1000);
     conn.exec(command, (err, stream) => {
@@ -105,7 +300,7 @@ async function runCommand(name: string, command: string, timeoutSec: number): Pr
 }
 
 async function withSftp<T>(name: string, fn: (sftp: import("ssh2").SFTPWrapper) => Promise<T>): Promise<T> {
-  const conn = await connect(getHost(name));
+  const conn = await connect(getHost(name), name);
   try {
     const sftp = await new Promise<import("ssh2").SFTPWrapper>((res, rej) => conn.sftp((e, s) => (e ? rej(e) : res(s))));
     return await fn(sftp);
@@ -432,7 +627,7 @@ async function openFx(name: string): Promise<Fx> {
       close: () => {},
     };
   }
-  const conn = await connect(cfg);
+  const conn = await connect(cfg, name);
   const sftp = await new Promise<import("ssh2").SFTPWrapper>((res, rej) => conn.sftp((e, s) => (e ? rej(e) : res(s)))).catch((e) => { conn.end(); throw e; });
   return {
     read: (p) => new Promise((res, rej) => sftp.readFile(p, (e, d) => (e ? rej(e) : res(d)))),
@@ -494,7 +689,7 @@ function streamExec(name: string, script: string, stdin: Readable | null, stdout
       child.on("close", finish);
       return;
     }
-    connect(cfg).then((conn) => {
+    connect(cfg, name).then((conn) => {
       kill = () => conn.destroy();
       if (aborted) { conn.destroy(); return finish(null); }
       conn.exec(`bash -c ${shq(script)}`, (err, stream) => {
@@ -716,7 +911,7 @@ async function auditShow(limit: number, contains: string | undefined, sinceMinut
         : e.ok ? "ok" : `FAILED${e.err ? `: ${clip(flat(String(e.err)), 160)}` : ""}`)
         + (e.confirmed ? ` (confirmed: ${clip(flat(String(e.confirmed)), 160)})` : "") + (e.ok && typeof e.added === "boolean" ? (e.added ? " (added)" : " (not added yet)") : "");
     const what = [r.bg ? "[background]" : "", r.cwd ? `(in ${r.cwd})` : "", r.what ?? ""].filter(Boolean).join(" ");
-    return [secs(r.t), r.ip ?? "-", r.via ?? "-", `${r.tool}${r.batch ? `#${String(r.batch).split("#")[1]}` : ""}`, r.host ?? "-", result,
+    return [secs(r.t), r.ip ?? "-", r.via ?? "-", `${r.tool}${r.batch ? `#${String(r.batch).split("#")[1]}` : ""}`, r.host ? `${r.host}${e?.kex ? " (pq)" : ""}` : "-", result,
       e ? `${(Number(e.ms) / 1000).toFixed(2)}s` : "-", clip(flat(what), 300)].join("  ").trimEnd();
   };
   const after = sinceMinutes === undefined ? -Infinity : Date.now() - sinceMinutes * 60_000;
@@ -1042,14 +1237,21 @@ function probeHost(host: string, port: number, username: string, privateKey: Buf
     c.connect({
       host, port, username, privateKey, readyTimeout: 15_000,
       hostVerifier: (key: Buffer) => { // remember what was presented, so the caller can show it
-        fp = `SHA256:${createHash("sha256").update(key).digest("base64").replace(/=+$/, "")}`;
-        const n = key.length >= 4 ? key.readUInt32BE(0) : 0;
-        keyType = n > 0 && n < 64 && key.length >= 4 + n ? key.subarray(4, 4 + n).toString("latin1") : "unknown";
+        fp = fingerprintOf(key);
+        keyType = keyTypeOf(key);
         return !expect || fp === expect;
       },
     });
   });
 }
+// The test add_host runs on a connection that is up: who it is logged in as, and where. Ends the connection.
+const whoIs = (c: Client, fallback: string): Promise<string> => new Promise((res) => c.exec("whoami; uname -n", (err, stream) => {
+  if (err) { c.end(); return res(fallback); }
+  let out = "";
+  stream.on("data", (d: Buffer) => (out += d));
+  stream.stderr.on("data", () => {});
+  stream.on("close", () => { c.end(); res(out.trim().split(/\s+/).slice(0, 2).join(" on ") || fallback); });
+}));
 const hostKeyFileOf = (type = "") => (type.startsWith("ecdsa") ? "ssh_host_ecdsa_key.pub" : /rsa/.test(type) ? "ssh_host_rsa_key.pub" : "ssh_host_ed25519_key.pub");
 
 function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: "?" }): McpServer {
@@ -1064,7 +1266,10 @@ function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: 
     inputSchema: {},
   }, async () => {
     const h = loadHosts();
-    return text(Object.entries(h).map(([k, v]) => v.local ? `${k}: (this VPS)` : `${k}: ${v.username}@${v.host}:${v.port ?? 22}`).join("\n"));
+    // v1.6: a host whose key exchange was decided says so; one that never was (written by hand, or older) reads as before
+    const kex = (v: HostCfg) => v.pq === true ? (PQ_MODE === "off" ? " (classical key exchange: PQ_SSH=off)" : " (post-quantum key exchange)")
+      : v.pq === false ? ` (classical key exchange${v.pqWhy ? `: ${v.pqWhy}` : ""})` : "";
+    return text(Object.entries(h).map(([k, v]) => v.local ? `${k}: (this VPS)` : `${k}: ${v.username}@${v.host}:${v.port ?? 22}${kex(v)}`).join("\n"));
   });
 
   tool("ssh_exec", {
@@ -1560,7 +1765,8 @@ function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: 
   tool("add_host", {
     description: "Connect another server to this connector, without editing hosts.json by hand. The connector has an SSH key of its own (created on first use). " +
       "If the server does not accept that key yet, the tool returns the public key line to add to the server's ~/.ssh/authorized_keys: have the user do that, then call it again. " +
-      "When the login works it runs a test command, pins the server's host key and saves the host, which can be used as `host` at once. There is no password option.",
+      "When the login works it runs a test command, pins the server's host key and saves the host, which can be used as `host` at once. There is no password option. " +
+      "The connection to that server uses post-quantum key exchange when the server's SSH has one; the result says which it is, and why not if not.",
     inputSchema: {
       name: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/).describe("Short name to use as `host` in the other tools, e.g. web-1"),
       host: z.string().regex(/^[A-Za-z0-9:][A-Za-z0-9.:-]{0,252}$/).describe("IP address or DNS name of the server"),
@@ -1580,35 +1786,69 @@ function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: 
       auditNote({ added: false });
       const key = await serial(connectorKey);
       const expect = fingerprint?.replace(/=+$/, "");
-      const p = await probeHost(host, port, username, key.privateKey, expect);
-      if (!p.fp) throw new Error(`Cannot reach ${host}:${port} over SSH: ${p.err ?? "no answer"}`);
-      if (expect && expect !== p.fp) throw new Error(`The host key of ${host}:${port} does not match: expected ${fingerprint}, but the server presented ${p.fp} (${p.keyType}). Nothing was added.`);
-      if (!p.ok && !p.authFailed) throw new Error(`${host}:${port} answered, but the login as ${username} did not complete: ${p.err}`);
-      if (!p.ok) return text([
-        `Not added yet: ${host}:${port} answered, but it does not accept this connector's key for the user ${username}.`,
-        "",
-        `1. On that server, as ${username}, add this line to ~/.ssh/authorized_keys:`,
-        `     ${key.publicKey}`,
-        "   For example by running this there:",
-        `     mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '${key.publicKey}' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys`,
-        `2. Make sure it is the right server: the host key it presented has the fingerprint ${p.fp}`,
-        `   (on that server: ssh-keygen -lf /etc/ssh/${hostKeyFileOf(p.keyType)})`,
-        `3. Call add_host again with the same arguments plus fingerprint: "${p.fp}", so that exactly this server is added.`,
-      ].join("\n"));
+      const hk = await presentedKey(host, port, username); // no login yet: first see which server this is
+      if ("err" in hk) throw new Error(`Cannot reach ${host}:${port} over SSH: ${hk.err}`);
+      if (expect && expect !== hk.fp) throw new Error(`The host key of ${host}:${port} does not match: expected ${fingerprint}, but the server presented ${hk.fp} (${hk.type}). Nothing was added.`);
+      // Post-quantum first: when it works, no login to this server ever crosses the network under a classical key exchange.
+      let pq: { kex: string; who: string; via: string } | null = null, why = "", refused = false;
+      if (PQ_MODE === "off") why = "PQ_SSH=off on this connector";
+      else {
+        const kex = await pqHere(), to = { host, port, username, keyPath: key.path, key: hk, kex }, home = `127.0.0.1:${port}`;
+        if (!kex.length) why = "this machine has no OpenSSH client with post-quantum key exchange";
+        // where the server's own SSH is, seen from the server: normally its loopback address and the same port; if not, the server is asked
+        for (const guess of kex.length ? [home, null] : []) {
+          try {
+            const via = guess ?? await ownSshAddress(to);
+            if (!via || (guess === null && via === home)) break; // it could not be asked, or it names what was just tried
+            const got = await pqGate(`${host}:${port}`, () => carried({ ...to, via, privateKey: key.privateKey }));
+            pq = { kex: got.kex, who: await whoIs(got.client, username), via };
+            break;
+          } catch (e) {
+            if (!isPqFail(e)) throw e;
+            if (e.kind === "hostkey") throw new Error(`The server at ${host}:${port} presented another host key a moment later (first ${hk.fp}). Nothing was added.`);
+            if (guess === home || !why) why = e.kind === "down" ? `the OpenSSH client could not connect: ${e.why}` : e.why;
+            refused = e.kind === "auth";
+            if (e.kind !== "noroute" && e.kind !== "innerkey") break;
+          }
+        }
+      }
+      let who = pq?.who;
+      if (!pq) {
+        if (PQ_MODE === "require" && !refused) throw new Error(`${host}:${port} cannot be connected to with post-quantum key exchange: ${why}. This connector only adds hosts that can (PQ_SSH=require). Nothing was added.`);
+        // The server said no to the key inside a post-quantum connection: that answer stands, and no second login is tried on a classical one.
+        const p: Probe = refused ? { ok: false, authFailed: true } : await probeHost(host, port, username, key.privateKey, hk.fp);
+        if (!p.ok && !p.authFailed) throw new Error(`${host}:${port} answered, but the login as ${username} did not complete: ${p.err}`);
+        if (!p.ok) return text([
+          `Not added yet: ${host}:${port} answered, but it does not accept this connector's key for the user ${username}.`,
+          "",
+          `1. On that server, as ${username}, add this line to ~/.ssh/authorized_keys:`,
+          `     ${key.publicKey}`,
+          "   For example by running this there:",
+          `     mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '${key.publicKey}' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys`,
+          `2. Make sure it is the right server: the host key it presented has the fingerprint ${hk.fp}`,
+          `   (on that server: ssh-keygen -lf /etc/ssh/${hostKeyFileOf(hk.type)})`,
+          `3. Call add_host again with the same arguments plus fingerprint: "${hk.fp}", so that exactly this server is added.`,
+        ].join("\n"));
+        who = p.who;
+      }
       await serial(async () => {
         const before = await fs.readFile(HOSTS_FILE, "utf8"), all = JSON.parse(before) as Record<string, HostCfg>;
         taken(all);
-        all[name] = { host, port, username, privateKeyPath: key.path, hostFingerprint: p.fp };
+        all[name] = { host, port, username, privateKeyPath: key.path, hostFingerprint: hk.fp,
+          ...(pq ? { pq: true, ...(pq.via !== `127.0.0.1:${port}` ? { pqVia: pq.via } : {}) } : PQ_MODE === "off" ? {} : { pq: false, pqWhy: why }) };
         await fs.writeFile(`${HOSTS_FILE}.bak`, before, { mode: 0o600 });
         await fs.writeFile(`${HOSTS_FILE}.new`, `${JSON.stringify(all, null, 2)}\n`, { mode: 0o600 });
         await fs.chmod(`${HOSTS_FILE}.new`, 0o600);
         await fs.rename(`${HOSTS_FILE}.new`, HOSTS_FILE); // all or nothing
       });
-      auditNote({ added: true, fp: p.fp });
+      if (pq) pqKeys.set(pqKeyId(host, port, hk.fp), hk);
+      auditNote({ added: true, fp: hk.fp, ...(pq ? { kex: pq.kex } : {}) });
       return text([
         `Added host "${name}": ${target}`,
-        `Host key pinned: ${p.fp} (${p.keyType})`,
-        `Test: logged in as ${p.who}`,
+        `Host key pinned: ${hk.fp} (${hk.type})`,
+        pq ? `Key exchange: ${pq.kex} (post-quantum) - the connection is made by this machine's OpenSSH client, everything else runs inside it`
+          : `Key exchange: classical. Post-quantum was not possible: ${why}.`,
+        `Test: logged in as ${who}`,
         `Use host: "${name}" in any tool. Saved in ${resolvePath(HOSTS_FILE)} (the previous version is kept as ${resolvePath(HOSTS_FILE)}.bak).`,
       ].join("\n"));
     } catch (e) { return fail(e); }
