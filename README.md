@@ -61,6 +61,10 @@ Options (environment variables in front of `bash`): `DOMAIN=mcp.example.com` to 
 [`install.sh`](install.sh) lists all of them. If something already listens on port 443, the installer leaves it
 alone and tells you which proxy rule to add.
 
+Ports 80 and 443: if this machine's own firewall (ufw or firewalld) is on, the installer opens them in it
+(`NO_FIREWALL=1` to skip). A firewall at your provider, such as an AWS security group or a cloud panel firewall,
+is outside the machine: open 80 and 443 there yourself. If they are closed, the installer says so.
+
 Run the same command again to **upgrade**: `hosts.json` and the secret are kept, the old `server.ts` is backed up,
 and it is put back automatically if the new one does not answer.
 

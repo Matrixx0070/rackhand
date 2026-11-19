@@ -19,6 +19,8 @@
 #   DOMAIN=mcp.example.com   use your own domain (its DNS A record must already point here)
 #   PUBLIC_IP=203.0.113.10   skip the public-IP lookup
 #   NO_CADDY=1               do not install or configure Caddy (bring your own HTTPS reverse proxy)
+#   NO_FIREWALL=1            leave this machine's firewall alone (otherwise ports 80 and 443 are opened in
+#                            ufw or firewalld when one of them is on)
 #   REPO=owner/name REF=main where to download the code from
 #   SRC=/path/to/checkout    install from a local directory instead of downloading
 #   APP=/opt/ssh-mcp SVC=ssh-mcp PORT=8787 ENVF=/etc/ssh-mcp.env STATE=/var/lib/ssh-mcp
@@ -28,13 +30,29 @@ set -euo pipefail
 REPO=${REPO:-Matrixx0070/rackhand}; REF=${REF:-main}; SRC=${SRC:-}
 APP=${APP:-/opt/ssh-mcp}; SVC=${SVC:-ssh-mcp}; PORT=${PORT:-8787}; ENVF=${ENVF:-/etc/$SVC.env}
 STATE=${STATE:-/var/lib/$SVC}   # job logs, sessions, saved output and the audit log
-NO_CADDY=${NO_CADDY:-0}; DOMAIN=${DOMAIN:-}; PUBLIC_IP=${PUBLIC_IP:-}
+NO_CADDY=${NO_CADDY:-0}; NO_FIREWALL=${NO_FIREWALL:-0}; DOMAIN=${DOMAIN:-}; PUBLIC_IP=${PUBLIC_IP:-}
 CADDYFILE=/etc/caddy/Caddyfile
 UNIT=/etc/systemd/system/$SVC.service
 
 say()  { printf '>> %s\n' "$*"; }
 warn() { printf '!! %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# Caddy needs ports 80 and 443 (Let's Encrypt, then HTTPS). Open them in this machine's own firewall when one is on.
+# A firewall at the provider (an AWS security group, a cloud panel firewall) is outside this machine: see the warning
+# printed when the HTTPS check fails.
+open_web_ports() {
+  [ "$NO_FIREWALL" = 1 ] && return 0
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    if ufw allow 80/tcp >/dev/null && ufw allow 443/tcp >/dev/null; then say "opened ports 80 and 443 in ufw"
+    else warn "could not open ports 80 and 443 in ufw; run: ufw allow 80/tcp && ufw allow 443/tcp"; fi
+  elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
+    if firewall-cmd --quiet --permanent --add-service=http --add-service=https && firewall-cmd --quiet --reload; then
+      say "opened ports 80 and 443 in firewalld"
+    else warn "could not open ports 80 and 443 in firewalld; run: firewall-cmd --permanent --add-service=http --add-service=https && firewall-cmd --reload"; fi
+  fi
+  return 0
+}
 
 [ "$(id -u)" = 0 ] || die "run as root (sudo bash install.sh)"
 [ "$(uname -s)" = Linux ] || die "Linux only"
@@ -132,7 +150,7 @@ tool_count() {
   curl -s -m 5 -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$URL_LOCAL" 2>/dev/null | grep -o '"name":"[a-z_]*"' | wc -l
 }
-wait_up() { local i n; for i in $(seq 1 30); do n=$(tool_count); [ "$n" -gt 0 ] && { echo "$n"; return 0; }; sleep 1; done; echo 0; return 1; }
+wait_up() { local n; for _ in $(seq 1 30); do n=$(tool_count); [ "$n" -gt 0 ] && { echo "$n"; return 0; }; sleep 1; done; echo 0; return 1; }
 if N=$(wait_up); then
   say "server is up: $N tools"
 else
@@ -202,16 +220,17 @@ WantedBy=multi-user.target
 EOF
       systemctl daemon-reload
     fi
+    open_web_ports
     systemctl enable caddy >/dev/null 2>&1 || true
     systemctl is-active --quiet caddy && systemctl reload caddy 2>/dev/null || systemctl restart caddy
     say "waiting for the HTTPS certificate for $DOMAIN (ports 80 and 443 must be open to the internet)"
-    for i in $(seq 1 30); do
+    for _ in $(seq 1 30); do
       code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
         -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "https://$DOMAIN/mcp/$MCP_SECRET" 2>/dev/null || true)
       [ "$code" = 200 ] && { HTTPS_OK=1; break; }
       sleep 2
     done
-    [ "$HTTPS_OK" = 1 ] || warn "https://$DOMAIN does not answer yet. Open ports 80 and 443 in the firewall / security group, then check: journalctl -u caddy -n 30"
+    [ "$HTTPS_OK" = 1 ] || warn "https://$DOMAIN does not answer yet. Open ports 80 and 443 to the internet at your provider (an AWS security group, a Hostinger / Hetzner / DigitalOcean cloud firewall) and in any other firewall on this machine, then check: journalctl -u caddy -n 30"
   fi
 fi
 
