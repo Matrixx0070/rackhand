@@ -76,13 +76,13 @@ if [ "$part" = all ] || [ "$part" = setup ]; then
   printf 'import time\nb = []\nfor i in range(400):\n    b.append(b"x" * (8 << 20))\n    time.sleep(0.01)\nprint("allocated", len(b) * 8, "MB")\n' > $R/hog.py
   if [ "$FIX" = 0 ]; then    # the live unit itself, pointed at the rehearsal's folder, port, secret and state
     LIVEAPP=$(sed -n 's/^WorkingDirectory=//p' $LIVEUNIT | head -1)
-    sed -e "s#${LIVEAPP:-/opt/ssh-mcp}#$R#g" -e "s#^Description=.*#Description=ssh-mcp connector (rehearsal copy - safe to delete)#" \
+    sed -e "s#${LIVEAPP:-/opt/ssh-mcp}#$R#g" -e "s#^Description=.*#Description=Rackhand connector (rehearsal copy - safe to delete)#" \
         -e "s#^EnvironmentFile=.*#EnvironmentFile=$R/env#" -e "s#^Environment=PORT=.*#Environment=PORT=$PORT#" \
         -e "s#^Environment=JOBS_DIR=.*#Environment=JOBS_DIR=$R/jobs#" $LIVEUNIT > $UNITF
   else
     cat > $UNITF <<EOF
 [Unit]
-Description=ssh-mcp connector (rehearsal copy - safe to delete)
+Description=Rackhand connector (rehearsal copy - safe to delete)
 After=network.target
 [Service]
 WorkingDirectory=$R

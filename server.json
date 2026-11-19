@@ -1,0 +1,46 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Matrixx0070/rackhand",
+  "title": "Rackhand",
+  "description": "SSH MCP server for AI agents: a real shell, files and jobs on every server, even behind NAT",
+  "version": "1.9.0",
+  "websiteUrl": "https://github.com/Matrixx0070/rackhand",
+  "repository": {
+    "url": "https://github.com/Matrixx0070/rackhand",
+    "source": "github"
+  },
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/Matrixx0070/rackhand/main/assets/rackhand-icon-512.png",
+      "mimeType": "image/png",
+      "sizes": [
+        "512x512"
+      ]
+    },
+    {
+      "src": "https://raw.githubusercontent.com/Matrixx0070/rackhand/main/assets/rackhand-icon.svg",
+      "mimeType": "image/svg+xml",
+      "sizes": [
+        "any"
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://{host}/mcp/{secret}",
+      "variables": {
+        "host": {
+          "description": "Your connector's host name, from the URL the installer printed",
+          "isRequired": true,
+          "placeholder": "203-0-113-10.sslip.io"
+        },
+        "secret": {
+          "description": "The 64 hex characters after /mcp/ in that URL. Whoever has it has a root shell: keep it secret",
+          "isRequired": true,
+          "isSecret": true
+        }
+      }
+    }
+  ]
+}

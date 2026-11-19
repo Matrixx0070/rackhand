@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# box - sandbox-side client for the ssh-mcp connector. The connector serves this file at /b/<token>/cli
+# box - sandbox-side client for the Rackhand connector. The connector serves this file at /b/<token>/cli
 # with its own URL filled in. Everything goes straight from this shell to the host over HTTPS:
 # no model in between, binary-safe, any size. Needs only bash, curl, tar, base64.
 set -o pipefail
@@ -8,7 +8,7 @@ VERSION="__BOX_VERSION__"
 
 usage() {
   cat >&2 <<'EOF'
-box - talk to the ssh-mcp connector from a sandbox shell
+box - talk to the Rackhand connector from a sandbox shell
 
   box exec [-t SEC] [-C DIR] [-y] [HOST] -- COMMAND   run a command: merged output, same exit code (-y: confirm a command the server refused)
                                                  COMMAND "-" reads a script from stdin

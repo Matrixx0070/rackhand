@@ -38,7 +38,7 @@ const NEW = ["bash", "read", "write", "edit", "bridge"]; // v1.2
 const V13 = ["batch"]; // v1.3
 const V14 = ["audit"]; // v1.4
 const V15 = ["add_host"]; // v1.5
-const VERSION = "1.8.0";
+const VERSION = "1.9.0";
 const ALL_TOOLS = [...OLD, ...NEW, ...V13, ...V14, ...V15];
 const HOSTS = ["local", "remote"];
 const MAX_OUT = 100_000;
@@ -1241,6 +1241,7 @@ test("V1 the five v1.2 tools are unchanged (bash only gained the optional `quiet
 test("I1 initialize: current version and short instructions that point every model at batch / bulk calls", async () => {
   const { json } = await rpc(BASE, "initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "e2e", version: "1" } });
   assert.equal(json.result.serverInfo.version, VERSION);
+  assert.equal(json.result.serverInfo.name, "rackhand");
   const ins = json.result.instructions;
   assert.equal(typeof ins, "string");
   for (const word of ["batch", "files", "ssh_exec_many", "quiet", "run_in_background", "audit", "add_host"]) assert.ok(ins.includes(word), `instructions do not mention ${word}`);

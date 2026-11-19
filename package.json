@@ -1,8 +1,34 @@
 {
-  "name": "ssh-mcp",
-  "version": "1.8.0",
+  "name": "rackhand",
+  "version": "1.9.0",
   "private": true,
-  "description": "Remote MCP server that gives an AI assistant a shell and files on your own VPS and on any host it can reach over SSH",
+  "description": "SSH MCP server for Claude, ChatGPT, Cursor and any AI agent: a real shell, files and jobs on your VPS and every server, even behind NAT. Formerly ssh-mcp.",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "ssh",
+    "sftp",
+    "remote-shell",
+    "devops",
+    "sysadmin",
+    "ai-agents",
+    "ai-tools",
+    "claude",
+    "chatgpt",
+    "cursor",
+    "llm",
+    "self-hosted",
+    "homelab",
+    "vps",
+    "post-quantum",
+    "reverse-tunnel",
+    "nat-traversal"
+  ],
+  "homepage": "https://github.com/Matrixx0070/rackhand#readme",
+  "bugs": {
+    "url": "https://github.com/Matrixx0070/rackhand/issues"
+  },
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -28,6 +54,6 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Matrixx0070/ssh-mcp.git"
+    "url": "git+https://github.com/Matrixx0070/rackhand.git"
   }
 }

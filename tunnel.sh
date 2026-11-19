@@ -1,5 +1,5 @@
 #!/bin/bash
-# ssh-mcp __VERSION__: connects this machine to the ssh-mcp connector at __URL__ as "__NAME__", through a tunnel
+# Rackhand __VERSION__: connects this machine to the Rackhand connector at __URL__ as "__NAME__", through a tunnel
 # that this machine opens: an SSH connection over HTTPS (port 443) that the connector's logins come back through.
 # Nothing on this machine has to be reachable from outside, and nothing changes on its firewall.
 #
@@ -28,7 +28,7 @@ main() {
   local unit=/etc/systemd/system/ssh-mcp-tunnel.service code="" reply=""
 
   say() { printf '%s\n' "$*"; }
-  die() { printf 'ssh-mcp tunnel: %s\n' "$*" >&2; exit 1; }
+  die() { printf 'rackhand tunnel: %s\n' "$*" >&2; exit 1; }
   # POST to the connector; sets $code (000 when it could not be reached) and $reply
   post() {
     local out
@@ -38,7 +38,7 @@ main() {
     code=${out##*$'\n'}; reply=${out%$'\n'*}
   }
 
-  say "ssh-mcp tunnel: connecting this machine to $url as \"$name\""
+  say "rackhand tunnel: connecting this machine to $url as \"$name\""
 
   # 1. what it needs
   if [ -z "$foreground" ]; then
@@ -110,7 +110,7 @@ main() {
   printf 'ssh-mcp-tunnel %s\n' "$tunnel_hostkey" > "$dir/known_hosts"
   {
     printf '#!/bin/bash\n'
-    printf '# ProxyCommand of the ssh-mcp tunnel (ssh-mcp %s): carries the SSH connection to %s over HTTPS -\n' "$version" "$url"
+    printf '# ProxyCommand of the Rackhand tunnel (Rackhand %s): carries the SSH connection to %s over HTTPS -\n' "$version" "$url"
     printf '# TLS to the connector, one HTTP upgrade, then the bytes as they are.\n'
     printf 'host=%q; port=%q; path=%q; hostheader=%q\n' "$host" "$tport" "/t/$id" "$([ "$tport" = 443 ] && printf %s "$host" || printf %s "$host:$tport")"
     cat <<'HELPER'
@@ -120,15 +120,15 @@ shopt -s lastpipe
 if [[ $host =~ ^[0-9.]+$ ]]; then name=(-noservername -verify_ip "$host"); else name=(-servername "$host" -verify_hostname "$host"); fi
 { printf 'GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: ssh-mcp-tunnel\r\nUser-Agent: ssh-mcp-tunnel\r\n\r\n' "$path" "$hostheader"; exec cat; } |
   openssl s_client -quiet -no_ign_eof -nocommands -verify_quiet -verify_return_error "${name[@]}" -connect "$host:$port" |
-  { IFS= read -r status || { echo "ssh-mcp tunnel: no answer from $host:$port" >&2; exit 1; }
-    case "$status" in "HTTP/1.1 101 "*) ;; *) echo "ssh-mcp tunnel: the connector answered: ${status%$'\r'}" >&2; exit 1 ;; esac
+  { IFS= read -r status || { echo "rackhand tunnel: no answer from $host:$port" >&2; exit 1; }
+    case "$status" in "HTTP/1.1 101 "*) ;; *) echo "rackhand tunnel: the connector answered: ${status%$'\r'}" >&2; exit 1 ;; esac
     while IFS= read -r line && [ -n "${line%$'\r'}" ]; do :; done
     exec cat; }
 HELPER
   } > "$dir/connect"
   chmod 700 "$dir/connect"
   cat > "$dir/ssh_config" <<EOF
-# ssh-mcp tunnel to $url, as "$name" (ssh-mcp $version)
+# Rackhand tunnel to $url, as "$name" (Rackhand $version)
 Host ssh-mcp-tunnel
   User $tuser
   ProxyCommand $dir/connect
@@ -184,7 +184,7 @@ EOF
   # 4. the service
   cat > "$unit" <<EOF
 [Unit]
-Description=ssh-mcp tunnel to $url (as "$name")
+Description=Rackhand tunnel to $url (as "$name")
 After=network-online.target
 Wants=network-online.target
 # keep trying, however long the connector or the network is away

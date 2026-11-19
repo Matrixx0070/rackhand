@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# ssh-mcp installer: one command on a fresh Linux VPS (run as root).
+# Rackhand installer (formerly ssh-mcp): one command on a fresh Linux VPS (run as root).
+# The service, paths and settings keep the name ssh-mcp, so older installs upgrade in place.
 #
-#   curl -fsSL https://raw.githubusercontent.com/Matrixx0070/ssh-mcp/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/Matrixx0070/rackhand/main/install.sh | sudo bash
 #
 # What it does:
 #   1. installs Node.js 22 if Node >= 20 is missing
@@ -24,7 +25,7 @@
 #                            install somewhere else / under another name (each install needs its own STATE)
 set -euo pipefail
 
-REPO=${REPO:-Matrixx0070/ssh-mcp}; REF=${REF:-main}; SRC=${SRC:-}
+REPO=${REPO:-Matrixx0070/rackhand}; REF=${REF:-main}; SRC=${SRC:-}
 APP=${APP:-/opt/ssh-mcp}; SVC=${SVC:-ssh-mcp}; PORT=${PORT:-8787}; ENVF=${ENVF:-/etc/$SVC.env}
 STATE=${STATE:-/var/lib/$SVC}   # job logs, sessions, saved output and the audit log
 NO_CADDY=${NO_CADDY:-0}; DOMAIN=${DOMAIN:-}; PUBLIC_IP=${PUBLIC_IP:-}
@@ -102,7 +103,7 @@ RUN_HOME=$(getent passwd 0 | cut -d: -f6); RUN_HOME=${RUN_HOME:-/root}
 install -d -m 700 "$STATE"      # private: it holds command output and the audit log
 cat > "$UNIT" <<EOF
 [Unit]
-Description=ssh-mcp connector (remote MCP server)
+Description=Rackhand connector (remote MCP server)
 After=network.target
 
 [Service]

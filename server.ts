@@ -25,7 +25,7 @@ const HOSTS_FILE = process.env.HOSTS_FILE ?? "./hosts.json";
 const MAX_OUT = 100_000;
 const JOBS_DIR = process.env.JOBS_DIR ?? "/var/lib/ssh-mcp/jobs"; // ssh_spawn: <jobId>.log / .exit / .pid / .cmd / .sh
 const MAX_PAYLOAD = 64 * 1024; // bytes of command/code sent inline (base64) in one shell argument
-const VERSION = "1.8.0";
+const VERSION = "1.9.0";
 // Sent to the client at initialize; clients put it in front of the model. Keep it short: it costs tokens in every conversation.
 const INSTRUCTIONS = `Remote shell and files on the hosts from list_hosts ("local" = the machine this connector runs on).
 Every tool call is a round trip, so do as much as possible per call:
@@ -1474,7 +1474,7 @@ async function setUpTunnelEnd(): Promise<TunnelEnd> {
   if (!k) throw new Error(`the tunnels' host key ${keyPath} cannot be read`);
   await fs.writeFile(keys, "", { mode: 0o644, flag: "wx" }).catch(made);
   await fs.writeFile(`${config}.new`, [
-    `# Written by ssh-mcp ${VERSION}: the SSH server end of the tunnels that machines open to this connector.`,
+    `# Written by Rackhand ${VERSION}: the SSH server end of the tunnels that machines open to this connector.`,
     "# It is not a daemon: the connector starts one for each tunnel (sshd -i), and it allows that tunnel and nothing else.",
     `HostKey ${keyPath}`,
     `AuthorizedKeysFile ${keys}`,
@@ -1632,7 +1632,7 @@ function carryTunnel(id: string, to: { name: string; key: string; port: number }
 }
 
 function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: "?" }): McpServer {
-  const server = new McpServer({ name: "ssh-connector", version: VERSION }, { instructions: INSTRUCTIONS });
+  const server = new McpServer({ name: "rackhand", version: VERSION }, { instructions: INSTRUCTIONS });
   // Tools are registered through `tool`, never directly: that is what puts every call in the audit log before it runs.
   const register = server.registerTool.bind(server) as unknown as (name: string, config: unknown, cb: (...xs: unknown[]) => Promise<ToolOut>) => unknown;
   const tool = ((name: string, config: unknown, cb: (...xs: unknown[]) => Promise<ToolOut>) =>
@@ -2629,6 +2629,6 @@ app.post("/t/:id/up", guarded(async (req, res) => {
 app.use((_req, res) => { res.status(404).end(); });
 
 await auditInit();
-const httpServer = app.listen(PORT, "127.0.0.1", () => console.log(`ssh-mcp listening on 127.0.0.1:${PORT}`));
+const httpServer = app.listen(PORT, "127.0.0.1", () => console.log(`rackhand listening on 127.0.0.1:${PORT}`));
 httpServer.on("upgrade", tunnelUpgrade); // v1.8: tunnels (everything else that asks for an upgrade is refused)
 if (!TUNNEL_OFF) void serial(tunnelTidy).catch((e) => console.error(`tunnels: ${(e as Error).message}`)); // what ran out while this was not running

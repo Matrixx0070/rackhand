@@ -1,13 +1,27 @@
-# ssh-mcp
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/rackhand-header-dark.svg">
+    <img alt="Rackhand: SSH MCP server for AI agents" src="assets/rackhand-header-light.svg" width="820">
+  </picture>
+</p>
 
-A remote [MCP](https://modelcontextprotocol.io) server that gives an AI assistant a real shell and real files on **your own
-VPS**, and on any other machine that VPS can reach over SSH.
+<p align="center">
+  <a href="https://github.com/Matrixx0070/rackhand/actions/workflows/test.yml"><img alt="Tests" src="https://github.com/Matrixx0070/rackhand/actions/workflows/test.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-3BFF8F?labelColor=060B08"></a>
+  <a href="https://modelcontextprotocol.io"><img alt="MCP: remote server" src="https://img.shields.io/badge/MCP-remote%20server-3BFF8F?labelColor=060B08"></a>
+</p>
+
+# Rackhand — SSH MCP server for AI agents
+
+Rackhand is a self-hosted, remote [MCP](https://modelcontextprotocol.io) server. It gives Claude, ChatGPT, Cursor or any
+AI agent a real shell, real files and background jobs on **your own VPS**, and on every machine that VPS can reach over
+SSH. Machines it cannot reach, behind NAT or a firewall, open a [tunnel](#machines-the-connector-cannot-reach-tunnels) to it instead.
 
 ```
 AI client (Claude, ChatGPT, Kimi, Cursor, your own agent)
         │  HTTPS, one secret URL
         ▼
-ssh-mcp on your VPS ──SSH/SFTP──▶ any host in hosts.json
+Rackhand on your VPS ──SSH/SFTP──▶ any host in hosts.json
 ```
 
 > **Read this first.** The connector URL contains a secret, and that secret is the only authentication.
@@ -16,14 +30,16 @@ ssh-mcp on your VPS ──SSH/SFTP──▶ any host in hosts.json
 > On AWS EC2, anyone with the URL can also use the instance's IAM role - check what that role allows
 > before you install (see [Security](#security)).
 
-18 tools, one install command, no account, no database. Version 1.8.0.
+18 tools, one install command, no account, no database. Version 1.9.0.
+
+Formerly **ssh-mcp**. The service, paths and settings keep that name, so existing installs upgrade in place.
 
 ## Quick start
 
 On a fresh Linux VPS (x86-64 or arm64, systemd, public IP, ports **80** and **443** open), as root:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Matrixx0070/ssh-mcp/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Matrixx0070/rackhand/main/install.sh | sudo bash
 ```
 
 The installer:
@@ -207,7 +223,7 @@ in `passphraseEnv`; never put a secret in `hosts.json` itself.
 ### Post-quantum key exchange
 
 Traffic that is recorded today can be decrypted later by whoever gets a large enough quantum computer, unless the
-key exchange that protected it was a post-quantum one. For the hosts it reaches over SSH, ssh-mcp uses one wherever
+key exchange that protected it was a post-quantum one. For the hosts it reaches over SSH, Rackhand uses one wherever
 the server has it:
 
 - `add_host` first tries a connection made by this machine's **OpenSSH client**, restricted to the post-quantum key
