@@ -1,7 +1,6 @@
 {
   "name": "rackhand",
   "version": "1.9.0",
-  "private": true,
   "description": "SSH MCP server for Claude, ChatGPT, Cursor and any AI agent: a real shell, files and jobs on your VPS and every server, even behind NAT. Formerly ssh-mcp.",
   "keywords": [
     "mcp",
@@ -30,6 +29,16 @@
     "url": "https://github.com/Matrixx0070/rackhand/issues"
   },
   "type": "module",
+  "files": [
+    "server.ts",
+    "box.sh",
+    "tunnel.sh",
+    "install.sh",
+    "upgrade/",
+    "hosts.example.json",
+    "tsconfig.json",
+    "server.json"
+  ],
   "engines": {
     "node": ">=20"
   },

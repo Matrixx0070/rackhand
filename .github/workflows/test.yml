@@ -19,5 +19,5 @@ jobs:
       - run: sudo apt-get install -y openssh-server openssh-client   # a real sshd for the post-quantum tests
       - run: npm ci
       - run: npm run typecheck
-      - run: bash -n install.sh box.sh tunnel.sh upgrade/deploy.sh upgrade/rehearse.sh
+      - run: for f in install.sh box.sh tunnel.sh upgrade/deploy.sh upgrade/rehearse.sh; do bash -n "$f" || exit 1; done
       - run: npm test
