@@ -65,6 +65,43 @@ Ports 80 and 443: if this machine's own firewall (ufw or firewalld) is on, the i
 (`NO_FIREWALL=1` to skip). A firewall at your provider, such as an AWS security group or a cloud panel firewall,
 is outside the machine: open 80 and 443 there yourself. If they are closed, the installer says so.
 
+### Ports 80 and 443 already in use
+
+The installer never changes a program that already holds one of these ports.
+
+- **Only port 80 is taken** (a web server, a panel): Caddy gets its certificate over port 443 alone and never
+  listens on 80. Nothing to do.
+- **Port 443 is taken** (nginx, Apache, Traefik, a hosting panel): the installer does not install Caddy. It prints
+  this nginx `server` block with your address filled in:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name 203-0-113-10.sslip.io;
+    ssl_certificate     /etc/letsencrypt/live/203-0-113-10.sslip.io/fullchain.pem;    # certbot certonly --nginx -d 203-0-113-10.sslip.io
+    ssl_certificate_key /etc/letsencrypt/live/203-0-113-10.sslip.io/privkey.pem;
+    location / {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;          # reverse tunnels
+        proxy_set_header Connection $http_connection;
+        proxy_buffering off;                             # replies stream
+        proxy_request_buffering off;
+        client_max_body_size 0;                          # file uploads
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+    }
+}
+```
+
+  For any other proxy, send `https://<your-address>` to `http://127.0.0.1:8787` and make sure it speaks HTTP/1.1
+  to the connector and passes `Upgrade` and `Connection` (reverse tunnels), does not buffer replies or uploads and
+  has no upload size limit, allows requests of an hour, and sends `Host`, `X-Forwarded-For` and
+  `X-Forwarded-Proto: https`.
+
 Run the same command again to **upgrade**: `hosts.json` and the secret are kept, the old `server.ts` is backed up,
 and it is put back automatically if the new one does not answer.
 

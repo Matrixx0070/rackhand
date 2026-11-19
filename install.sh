@@ -54,6 +54,56 @@ open_web_ports() {
   return 0
 }
 
+# The program listening on a TCP port, unless it is Caddy (which this installer shares).
+port_user() { ss -ltnpH "sport = :$1" 2>/dev/null | grep -v caddy | grep -o 'users:(("[^"]*"' | head -1 | cut -d'"' -f2 || true; }
+
+# Put "$1" in the Caddyfile's global options block (it has to be the first block), making the block if needed.
+# An option of that name that is already there wins.
+caddy_global_option() {
+  local f="$CADDYFILE" first
+  touch "$f"
+  grep -qE "^[[:space:]]*${1%% *}([[:space:]]|$)" "$f" && return 0
+  first=$(grep -nvE '^[[:space:]]*(#.*)?$' "$f" | head -1 || true)       # first line that is not blank or a comment
+  if [[ "${first#*:}" =~ ^[[:space:]]*\{[[:space:]]*$ ]]; then sed -i "${first%%:*}a\\    $1" "$f"
+  elif [ -s "$f" ]; then sed -i "1i {\\n    $1\\n}\\n" "$f"
+  else printf '{\n    %s\n}\n' "$1" > "$f"; fi
+}
+
+# This installer's own site in the Caddyfile: from its marker line to the closing brace.
+our_site() { awk -v m="$MARK" '$0 == m {p = 1} p {print} p && /^}$/ {exit}' "$CADDYFILE"; }
+
+# Port 443 belongs to another web server: what to add to it (nginx shown; README covers the rest).
+proxy_help() {
+  cat <<EOF
+
+   For nginx, a file in /etc/nginx/conf.d/ (then: nginx -t && systemctl reload nginx):
+
+   server {
+       listen 443 ssl;
+       server_name $DOMAIN;
+       ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;    # certbot certonly --nginx -d $DOMAIN
+       ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+       location / {
+           proxy_pass http://127.0.0.1:$PORT;
+           proxy_http_version 1.1;
+           proxy_set_header Host \$host;
+           proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+           proxy_set_header X-Forwarded-Proto https;
+           proxy_set_header Upgrade \$http_upgrade;          # reverse tunnels
+           proxy_set_header Connection \$http_connection;
+           proxy_buffering off;                             # replies stream
+           proxy_request_buffering off;
+           client_max_body_size 0;                          # file uploads
+           proxy_read_timeout 1h;
+           proxy_send_timeout 1h;
+       }
+   }
+
+   Another proxy (Apache, Traefik, a panel): see "Ports 80 and 443 already in use" in the README.
+
+EOF
+}
+
 [ "$(id -u)" = 0 ] || die "run as root (sudo bash install.sh)"
 [ "$(uname -s)" = Linux ] || die "Linux only"
 command -v systemctl >/dev/null && [ -d /run/systemd/system ] || die "systemd is required"
@@ -180,9 +230,10 @@ if [ "$NO_CADDY" = 1 ]; then
 elif [ -z "$DOMAIN" ]; then
   warn "could not work out this machine's public IP - run again with DOMAIN=your.domain or PUBLIC_IP=x.x.x.x"
 else
-  BUSY=$(ss -ltnpH 'sport = :443' 2>/dev/null | grep -v caddy | grep -o 'users:(("[^"]*"' | head -1 | cut -d'"' -f2 || true)
+  BUSY=$(port_user 443); BUSY80=$(port_user 80)
   if [ -n "$BUSY" ]; then
-    warn "port 443 is already used by '$BUSY' - not installing Caddy. Add a reverse proxy rule there:  https://$DOMAIN  ->  127.0.0.1:$PORT"
+    warn "port 443 is already used by '$BUSY' - not installing Caddy; '$BUSY' is left as it is. Add this server to it:"
+    proxy_help
   else
     if ! command -v caddy >/dev/null; then
       say "installing Caddy"
@@ -191,11 +242,22 @@ else
     fi
     mkdir -p /etc/caddy /var/lib/caddy
     MARK="# ssh-mcp ($SVC)"
-    if [ -f "$CADDYFILE" ] && grep -qF "$MARK" "$CADDYFILE"; then
+    if [ -f "$CADDYFILE" ] && grep -qF "$MARK" "$CADDYFILE" && { [ -z "$BUSY80" ] || our_site | grep -q disable_http_challenge; }; then
       say "Caddyfile already has the $SVC site"
     else
       [ -f "$CADDYFILE" ] && cp -p "$CADDYFILE" "$CADDYFILE.bak-$TS"       # other sites in it are left as they are
-      printf '\n%s\n%s {\n    reverse_proxy 127.0.0.1:%s\n}\n' "$MARK" "$DOMAIN" "$PORT" >> "$CADDYFILE"
+      if [ -f "$CADDYFILE" ] && grep -qF "$MARK" "$CADDYFILE"; then        # our own older site, written before port 80 was taken
+        awk -v m="$MARK" '$0 == m {skip = 1; next} skip && /^}$/ {skip = 0; next} !skip' "$CADDYFILE" > "$CADDYFILE.new"
+        cat "$CADDYFILE.new" > "$CADDYFILE" && rm -f "$CADDYFILE.new"
+      fi
+      if [ -n "$BUSY80" ]; then
+        # port 80 belongs to another program: get the certificate over 443 only and never listen on 80
+        say "port 80 is used by '$BUSY80' (left as it is): Caddy will use port 443 only"
+        caddy_global_option "auto_https disable_redirects"
+        printf '\n%s\n%s {\n    tls {\n        issuer acme {\n            disable_http_challenge\n        }\n    }\n    reverse_proxy 127.0.0.1:%s\n}\n' "$MARK" "$DOMAIN" "$PORT" >> "$CADDYFILE"
+      else
+        printf '\n%s\n%s {\n    reverse_proxy 127.0.0.1:%s\n}\n' "$MARK" "$DOMAIN" "$PORT" >> "$CADDYFILE"
+      fi
     fi
     if ! systemctl cat caddy >/dev/null 2>&1; then
       cat > /etc/systemd/system/caddy.service <<EOF
