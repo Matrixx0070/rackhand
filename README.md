@@ -16,7 +16,7 @@ ssh-mcp on your VPS ──SSH/SFTP──▶ any host in hosts.json
 > On AWS EC2, anyone with the URL can also use the instance's IAM role - check what that role allows
 > before you install (see [Security](#security)).
 
-18 tools, one install command, no account, no database. Version 1.7.0.
+18 tools, one install command, no account, no database. Version 1.8.0.
 
 ## Quick start
 
@@ -248,6 +248,62 @@ What it does not cover:
 - Only the key exchange is post-quantum. Host keys and login keys are the usual ones: breaking those lets an
   attacker impersonate a server in the future, not read what was recorded in the past.
 
+### Machines the connector cannot reach: tunnels
+
+A machine behind NAT or a firewall - a PC at home, a laptop, a server in a private network - can be a host too. It
+is not connected to; it connects. Ask the assistant: *"add my home PC as home-pc, user frank, it is behind NAT"*, which
+is `add_host` with `tunnel: true` (and no `host`). The answer is one command to run on that machine, as root:
+
+```bash
+curl -fsSL https://<your-connector>/t/<link> | sudo bash
+```
+
+The link works once, within 30 minutes (`curl -fsSL <link>` shows the script without running it). The script
+
+1. checks for an OpenSSH client with a post-quantum key exchange (OpenSSH 9.0 or newer), OpenSSL 1.1.1 or newer,
+   curl, and an SSH server on the port given to `add_host` (22 unless told otherwise),
+2. adds the connector's key to that user's `~/.ssh/authorized_keys`,
+3. makes a key for the tunnel in `/etc/ssh-mcp-tunnel`, and sends the connector that key and the machine's SSH host keys,
+4. installs the systemd service `ssh-mcp-tunnel`, which keeps an SSH connection open to the connector **over HTTPS**
+   (port 443) and opens it again when it drops,
+5. waits until the connector has logged in through it, and prints `connected: ...`.
+
+From then on the machine is `127.0.0.1:<port>` on the connector, with its host key pinned, and every tool works
+with it. `list_hosts` tells whether its tunnel is open:
+
+```
+home-pc: frank@127.0.0.1:20200 (reverse tunnel: open, post-quantum key exchange mlkem768x25519-sha256)
+```
+
+and a call while it is not open says so, instead of a bare "connection refused".
+
+How it is locked down:
+
+- **Nothing new has to be reachable, on either side.** The tunnel comes in through the connector's HTTPS port (Caddy
+  passes the HTTP upgrade on to the connector), and the machine only makes outgoing connections.
+- **At the connector, a tunnel can do one thing.** Each tunnel gets an `sshd -i` of its own, with a configuration
+  (`/var/lib/ssh-mcp-tunnel/sshd_config`) that allows a remote forward to the one port that tunnel's key is bound to
+  (`permitlisten`) and nothing else: no shell and no command (`MaxSessions 0`), no forwarding into the connector's
+  machine (`AllowTcpForwarding remote`, `PermitOpen none`), **post-quantum key exchange only**. It logs in as the
+  account `sshmcp-tunnel`, which is created on first use, without a password or a shell.
+- **Both ends are pinned.** The connector's tunnel host key is written into the script (fetched over HTTPS) and
+  pinned on the machine; the machine's SSH host key must be one of those it reported, and is pinned on the connector.
+- The tunnel's address on the connector is a secret of its own. An unknown address, a used-up link, another key,
+  another port: nothing.
+- A machine that comes back on a new connection (after a reboot, or when its network changed) replaces the one it
+  left open at once, instead of waiting until that one times out.
+- `add_host` with `replace: true` hands the name to another machine; the old one keeps working until the new one is
+  in, then its key and address stop working.
+
+To undo it on the machine: `systemctl disable --now ssh-mcp-tunnel; rm -r /etc/ssh-mcp-tunnel
+/etc/systemd/system/ssh-mcp-tunnel.service`, and remove the connector's line from `authorized_keys`. On the
+connector, remove the host from `hosts.json`: its key goes from the tunnel's `authorized_keys` at the next start or
+`add_host`. Without root or systemd, `SSHMCP_TUNNEL_FOREGROUND=1` keeps the tunnel in the foreground instead of a
+service (`SSHMCP_TUNNEL_DIR` and `SSHMCP_AUTHORIZED_KEYS` say where its files and the connector's key go).
+
+Settings, in `/etc/ssh-mcp.env`: `TUNNEL=off` turns tunnels off; `TUNNEL_PORTS` (`20200-20999`) are the ports they
+get; `TUNNEL_USER` is the account they log in as; `TUNNEL_DIR` is where their `sshd` keeps its files.
+
 ## The bridge and the `box` command
 
 For an assistant that has its own sandbox shell: `bridge` returns `https://<host>/b/<token>`, and from that shell
@@ -337,6 +393,8 @@ back by itself.
 - Connections to those hosts use [post-quantum key exchange](#post-quantum-key-exchange) where the server has it,
   and a host added that way does not fall back. The leg from the AI client to this server is TLS, and how strong
   that is against a future quantum computer depends on the client.
+- [Tunnels](#machines-the-connector-cannot-reach-tunnels) come in through the HTTPS port and can only pass the
+  connector's connections on to the machine's own SSH server; their key exchange is post-quantum only.
 - **Cloud credentials on the machine are in reach too.** On AWS EC2 the instance's IAM role can be used by anyone
   with a shell, so anyone with the URL has that role's permissions. The installer prints a warning when it finds a
   role. Give the instance no role, or one with only the permissions the machine itself needs.
@@ -353,17 +411,18 @@ Found a security problem? Please report it privately (GitHub: Security → Repor
 ```bash
 npm ci
 npm run typecheck
-npm test          # 163 black-box tests over the HTTP endpoint, against "local", an in-process SSH server and a real sshd
+npm test          # 174 black-box tests over the HTTP endpoint, against "local", an in-process SSH server and a real sshd
 ```
 
 The whole server is one file, [`server.ts`](server.ts), run with `tsx`; [`box.sh`](box.sh) is the bridge client the
 server hands out. Configuration is by environment variable: `MCP_SECRET` (required, 32+ characters), `PORT` (8787),
 `HOSTS_FILE` (`./hosts.json`), `JOBS_DIR` (`/var/lib/ssh-mcp/jobs`), `PUBLIC_URL` (only if the proxy does not send
-`X-Forwarded-Host`), the `AUDIT_*` settings above, `TRIPWIRE=off`, `PQ_SSH` (`off` or `require`) and `PQ_SSH_KEEP`.
+`X-Forwarded-Host`), the `AUDIT_*` settings above, `TRIPWIRE=off`, `PQ_SSH` (`off` or `require`), `PQ_SSH_KEEP`, and
+`TUNNEL`, `TUNNEL_PORTS`, `TUNNEL_USER` and `TUNNEL_DIR`.
 
-The fourteen post-quantum tests start a private `sshd` on a loopback port and read its log, so they need the OpenSSH
-server and a client with a post-quantum key exchange (`apt-get install openssh-server openssh-client`); without
-them they are skipped and say so.
+The fifteen post-quantum tests and the eight tunnel tests start a private `sshd` on a loopback port and read its
+log, so they need the OpenSSH server and a client with a post-quantum key exchange (`apt-get install openssh-server
+openssh-client`), and the tunnel tests openssl and curl as well; without them they are skipped and say so.
 
 ## License
 

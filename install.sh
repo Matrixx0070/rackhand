@@ -70,12 +70,12 @@ else
   say "downloading $REPO@$REF"
   curl -fsSL "https://codeload.github.com/$REPO/tar.gz/$REF" | tar -xz -C "$STAGE" --strip-components=1
 fi
-for f in server.ts box.sh package.json package-lock.json; do [ -s "$STAGE/$f" ] || die "the source has no $f"; done
+for f in server.ts box.sh tunnel.sh package.json package-lock.json; do [ -s "$STAGE/$f" ] || die "the source has no $f"; done
 
 mkdir -p "$APP"; chmod 755 "$APP"
 TS=$(date -u +%Y%m%d-%H%M%S); BAK=""
 if [ "$FRESH" = 0 ]; then BAK="$APP/server.ts.bak-$TS"; cp -p "$APP/server.ts" "$BAK"; say "upgrade: old server.ts kept as $BAK"; fi
-for f in server.ts box.sh package.json package-lock.json tsconfig.json hosts.example.json README.md LICENSE; do
+for f in server.ts box.sh tunnel.sh package.json package-lock.json tsconfig.json hosts.example.json README.md LICENSE; do
   [ -e "$STAGE/$f" ] && cp -f "$STAGE/$f" "$APP/$f"
 done
 for d in upgrade test; do [ -d "$STAGE/$d" ] && { mkdir -p "$APP/$d"; cp -af "$STAGE/$d/." "$APP/$d/"; }; done

@@ -4,13 +4,14 @@
 // Run: node --test test/e2e.mjs      (SERVER_FILE=server.ts by default)
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, execFile, execFileSync } from "node:child_process";
+import { spawn, spawnSync, execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { appendFileSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, renameSync, existsSync, statSync, lstatSync, chmodSync, truncateSync,
   openSync, readSync, writeSync, fstatSync, fchmodSync, closeSync } from "node:fs";
 import { createHash, createHmac, randomBytes } from "node:crypto";
-import { tmpdir, userInfo } from "node:os";
+import { tmpdir, userInfo, homedir } from "node:os";
 import net from "node:net";
+import tls from "node:tls";
 import path from "node:path";
 import http from "node:http";
 import { getDefaultHighWaterMark } from "node:stream";
@@ -37,7 +38,7 @@ const NEW = ["bash", "read", "write", "edit", "bridge"]; // v1.2
 const V13 = ["batch"]; // v1.3
 const V14 = ["audit"]; // v1.4
 const V15 = ["add_host"]; // v1.5
-const VERSION = "1.7.0";
+const VERSION = "1.8.0";
 const ALL_TOOLS = [...OLD, ...NEW, ...V13, ...V14, ...V15];
 const HOSTS = ["local", "remote"];
 const MAX_OUT = 100_000;
@@ -188,7 +189,9 @@ before(async () => {
   await startServer(PORT);
   await startServer(PORT2, { JOBS_DIR: "/proc/nope/jobs", HOME: HOME2 });
 });
+const cleanups = []; // run last, whatever happened
 after(() => {
+  for (const f of cleanups) try { f(); } catch { /* best effort */ }
   for (const p of servers) p.kill("SIGKILL");
   sshd.srv.close();
   sshd2.srv.close();
@@ -2485,6 +2488,15 @@ test("K13 PQ_SSH_KEEP=0: nothing is kept, every call makes its own connection", 
   assert.equal(helpers(), 0, "and none is left open");
 });
 
+test("K15 calls that come in the moment a shared connection goes down are moved to a new one: none of them fails", { skip: NO_REAL }, async () => {
+  for (let round = 0; round < 6; round++) {
+    assert.equal((await call("bash", { host: "pq-1", command: "echo up" })).text, "up\n"); // a shared connection is open
+    if (round % 2) pkill9("HostKeyAlias=sshmcp-"); else realA.dropConnections();               // and it is gone, now: this end's carrier, or the server
+    const rs = await Promise.all(Array.from({ length: 8 }, (_, i) => call("bash", { host: "pq-1", command: `echo k15-${round}-${i}` })));
+    assert.deepEqual(rs.map((r) => r.text), Array.from({ length: 8 }, (_, i) => `k15-${round}-${i}\n`), `round ${round}`);
+  }
+});
+
 test("K14 the audit log records the key exchange of each call, and no helper process is left behind", { skip: NO_REAL }, async () => {
   const es = auditEntries().filter((e) => e.host === "pq-1" && e.done);
   const through = es.find((e) => e.what === "echo through-pq; id -un");
@@ -2496,4 +2508,411 @@ test("K14 the audit log records the key exchange of each call, and no helper pro
   let left = "";
   for (let i = 0; i < 80; i++) { left = pgrep("HostKeyAlias=sshmcp-"); if (!left) break; await sleep(100); } // connections are kept for 3 s here
   assert.equal(left, "", "OpenSSH helper processes still running");
+});
+
+// ═════════════════════════ v1.8: tunnels, for machines this connector cannot reach ═════════════════════════
+// The machine is a private sshd of its own ("U.target"); the connector is a server of its own too, reached over TLS
+// through a small terminator that plays Caddy's part; and the script add_host's link serves runs as it would on that
+// machine, only with the tunnel kept in the foreground instead of a systemd service, and its files in a folder here.
+const CURL_OK = spawnSync("curl", ["--version"]).status === 0;
+const OPENSSL_OK = (() => { const r = spawnSync("openssl", ["s_client", "-help"], { encoding: "utf8" }); return /-nocommands/.test(`${r.stdout}${r.stderr}`); })();
+const NO_TUNNEL = NO_REAL || (!OPENSSL_OK ? "no openssl 1.1.1 or newer on this machine" : !CURL_OK ? "no curl on this machine" : false);
+let U; // the rig, made in U1
+const tunnelRuns = [];
+cleanups.push(() => { for (const r of tunnelRuns) r.stop(); });
+
+async function tunnelRig() {
+  const port = await freePort(), tlsPort = await freePort();
+  // sshd checks the modes of every folder above its key file up to the home folder: one under /tmp would not do
+  const dir = mkdtempSync(path.join(homedir(), ".ssh-mcp-test-tunnel-"));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const certDir = P("u-tls");
+  mkdirSync(certDir);
+  const cert = path.join(certDir, "cert.pem"), key = path.join(certDir, "key.pem");
+  execFileSync("openssl", ["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-subj", "/CN=127.0.0.1",
+    "-addext", "subjectAltName=IP:127.0.0.1", "-days", "2", "-keyout", key, "-out", cert], { stdio: "ignore" });
+  const terminator = tls.createServer({ key: readFileSync(key), cert: readFileSync(cert) }, (s) => {
+    const up = net.connect(port, "127.0.0.1");
+    s.pipe(up);
+    up.pipe(s);
+    for (const [a, b] of [[s, up], [up, s]]) { a.on("error", () => b.destroy()); a.on("close", () => b.destroy()); }
+  });
+  await new Promise((r) => terminator.listen(tlsPort, "127.0.0.1", r));
+  cleanups.push(() => terminator.close());
+  const hosts = P("u-hosts.json"), state = P("u-state");
+  writeFileSync(hosts, JSON.stringify({ local: { local: true } }));
+  // PATH as the installer's unit has it: no sbin directories, so nothing in the tunnel code may need them on the PATH
+  const env = { HOSTS_FILE: hosts, JOBS_DIR: path.join(state, "jobs"), PUBLIC_URL: `https://127.0.0.1:${tlsPort}`, TUNNEL_DIR: dir, TUNNEL_USER: ME,
+    PATH: [path.dirname(process.execPath), "/usr/local/bin", "/usr/bin", "/bin"].join(":") };
+  const server = await startServer(port, env);
+  const target = await realSshd();
+  return { server, base: `http://127.0.0.1:${port}/mcp/${SECRET}`, http: `http://127.0.0.1:${port}`, port, tlsPort, env, dir, state, hosts, cert, target,
+    audit: path.join(state, "audit", "audit.jsonl"), connectorPub: () => readFileSync(path.join(state, "keys", "id_ed25519.pub"), "utf8").trim() };
+}
+// The environment of anything on "the machine" that talks to the connector: it trusts the terminator's certificate,
+// and goes there directly (this sandbox may have a proxy for the outside world).
+function machineEnv(more = {}) {
+  const env = { ...process.env, SSL_CERT_FILE: U.cert, CURL_CA_BUNDLE: U.cert, NO_PROXY: "127.0.0.1,localhost", no_proxy: "127.0.0.1,localhost", ...more };
+  for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]) delete env[k];
+  return env;
+}
+function background(cmd, args, env) {
+  const p = spawn(cmd, args, { env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+  const run = { proc: p, out: "", stop() { try { process.kill(-p.pid, "SIGKILL"); } catch { /* gone */ } } };
+  p.stdout.on("data", (d) => (run.out += d));
+  p.stderr.on("data", (d) => (run.out += d));
+  tunnelRuns.push(run);
+  return run;
+}
+// The script from the link, run as on the machine: in the foreground, its files in `dir`, the connector's key going
+// into the target sshd's authorized_keys.
+function runScript(script, dir) {
+  writeFileSync(`${dir}.sh`, script);
+  return background("bash", [`${dir}.sh`], machineEnv({ SSHMCP_TUNNEL_FOREGROUND: "1", SSHMCP_TUNNEL_DIR: dir, SSHMCP_AUTHORIZED_KEYS: U.target.authorized, SSHMCP_TUNNEL_RETRY: "1" }));
+}
+// The tunnel as the machine's service runs it, from the files the script left there: once, or again and again.
+const tunnelFrom = (dir, again = false) => background("bash", ["-c", again
+  ? `while :; do ssh -F ${dir}/ssh_config -N -T ssh-mcp-tunnel </dev/null; sleep 1; done`
+  : `exec ssh -F ${dir}/ssh_config -N -T ssh-mcp-tunnel </dev/null`], machineEnv());
+async function until(fn, ms, what) {
+  const t0 = Date.now();
+  for (;;) {
+    const v = await fn();
+    if (v) return v;
+    if (Date.now() - t0 > ms) throw new Error(`gave up after ${ms} ms waiting for: ${what}`);
+    await sleep(200);
+  }
+}
+const linkIn = (text) => (/^  curl -fsSL https:\/\/127\.0\.0\.1:\d+\/t\/([0-9a-f]{32}) \| sudo bash$/m.exec(text) ?? [])[1];
+const uHosts = () => JSON.parse(readFileSync(U.hosts, "utf8"));
+const tunnelKeys = () => readFileSync(path.join(U.dir, "authorized_keys"), "utf8");
+// What the connector answers to a request for a tunnel at /t/<id>: the status line, or "" when it shut the door.
+function upgradeStatus(port, id, upgrade = "ssh-mcp-tunnel") {
+  return new Promise((res) => {
+    const sock = net.connect(port, "127.0.0.1", () => sock.write(`GET /t/${id} HTTP/1.1\r\nHost: x\r\n${upgrade ? `Connection: Upgrade\r\nUpgrade: ${upgrade}\r\n` : ""}\r\n`));
+    let got = "";
+    sock.on("data", (d) => { got += d; if (got.includes("\r\n")) { sock.destroy(); res(got.split("\r\n")[0]); } });
+    sock.on("error", () => res(""));
+    sock.on("close", () => res(got.split("\r\n")[0]));
+  });
+}
+// The tunnels open now, as the audit log has them: a tunnel's entry stays open until the tunnel ends. (Its sshd cannot be
+// counted with pgrep: once a login is in, it gives its processes other names.)
+const openTunnels = () => auditEntries(U.audit).filter((e) => e.tool === "tunnel" && !e.done).length;
+const tunnelIsOpen = async () => /^nat-1: .* \(reverse tunnel: open, /m.test((await call("list_hosts", {}, U.base)).text);
+
+test("U1 add_host with tunnel: true hands out a link, good once, to a script for that machine; nothing is added yet, and the tunnels' own SSH server is locked down", { skip: NO_TUNNEL }, async () => {
+  U = await tunnelRig();
+  const r = await call("add_host", { name: "nat-1", tunnel: true, username: ME, port: U.target.port }, U.base);
+  assert.equal(r.isError, false, r.text);
+  assert.match(r.text, /^Not added yet: "nat-1" is to connect to this connector through a tunnel of its own\./);
+  assert.match(r.text, /The link works once, until \d\d:\d\d UTC \(30 minutes\)/);
+  U.link = linkIn(r.text);
+  assert.ok(U.link, r.text);
+  assert.ok(r.text.includes(`curl -fsSL https://127.0.0.1:${U.tlsPort}/t/${U.link} | sudo bash`));
+  assert.equal("nat-1" in uHosts(), false, "nothing is added yet");
+
+  // the link can be read as often as one likes before it is used: a bash script for exactly that machine
+  const s1 = await (await fetch(`${U.http}/t/${U.link}`)).text(), s2 = await (await fetch(`${U.http}/t/${U.link}`)).text();
+  assert.equal(s1, s2);
+  assert.match(s1, /^#!\/bin\/bash\n/);
+  for (const v of [`name='nat-1'`, `user='${ME}'`, `sshd_port='${U.target.port}'`, `url='https://127.0.0.1:${U.tlsPort}'`, `enroll='${U.link}'`])
+    assert.ok(s1.includes(v), v);
+  assert.ok(s1.includes(U.connectorPub().split(" ")[1]), "with the connector's key in it");
+  assert.doesNotMatch(s1, /__[A-Z_]+__/, "every blank is filled in");
+  assert.equal(spawnSync("bash", ["-n"], { input: s1 }).status, 0, "and it is valid bash");
+  U.script = s1;
+  for (const bad of [randomBytes(16).toString("hex"), "not-a-link", U.link.toUpperCase()]) assert.equal((await fetch(`${U.http}/t/${bad}`)).status, 404, bad);
+
+  // the link is kept in the connector's private state - not in the folder the tunnels' sshd reads as another user
+  assert.equal(statSync(path.join(U.state, "tunnel")).mode & 0o777, 0o700);
+  assert.ok(existsSync(path.join(U.state, "tunnel", `${U.link}.json`)));
+  assert.deepEqual(readdirSync(U.dir).sort(), ["authorized_keys", "host_ed25519", "sshd_config"]);
+  assert.equal(tunnelKeys(), "", "no key can use it yet");
+  assert.equal(statSync(path.join(U.dir, "host_ed25519")).mode & 0o777, 0o600);
+
+  // the SSH server end of the tunnels: one remote forward and nothing else, post-quantum key exchange only
+  const cfg = readFileSync(path.join(U.dir, "sshd_config"), "utf8").split("\n");
+  for (const line of ["MaxSessions 0", "AllowTcpForwarding remote", "PermitOpen none", "GatewayPorts no", "AllowStreamLocalForwarding no", "AllowAgentForwarding no",
+    "X11Forwarding no", "PermitTunnel no", "PermitTTY no", "PasswordAuthentication no", "AuthenticationMethods publickey", "UsePAM no", `AllowUsers ${ME}`, "StrictModes yes"])
+    assert.ok(cfg.includes(line), line);
+  const kex = (cfg.find((l) => l.startsWith("KexAlgorithms ")) ?? "").slice(14).split(",");
+  assert.ok(kex.length && kex.every((k) => PQ_HERE.includes(k)), kex.join(","));
+  assert.equal(spawnSync(SSHD_BIN, ["-t", "-f", path.join(U.dir, "sshd_config")]).status, 0, "sshd takes that configuration");
+
+  // what is refused
+  const both = await call("add_host", { name: "nat-x", tunnel: true, host: "10.0.0.1", username: ME }, U.base);
+  assert.equal(both.isError, true);
+  assert.match(both.text, /leave host out/);
+  const none = await call("add_host", { name: "nat-x", username: ME }, U.base);
+  assert.equal(none.isError, true);
+  assert.match(none.text, /host is required/);
+  const plainHttp = await call("add_host", { name: "nat-x", tunnel: true, username: ME }); // the main test server is reached over plain HTTP
+  assert.equal(plainHttp.isError, true, plainHttp.text);
+  assert.match(plainHttp.text, /over HTTPS/);
+  assert.equal("nat-x" in uHosts(), false);
+});
+
+test("U2 the script, run on that machine, brings it in - and every kind of call then goes through its tunnel", { skip: NO_TUNNEL }, async () => {
+  U.m1 = P("u-machine-1");
+  const someone = `ssh-ed25519 ${utils.parseKey(keyPair().private).getPublicSSH().toString("base64")} someone@else`;
+  writeFileSync(U.target.authorized, someone); // a key that was there before, its line without a line break at the end
+  U.run1 = runScript(U.script, U.m1);
+  await until(() => /^connected: /m.test(U.run1.out) || U.run1.proc.exitCode !== null, 90_000, "the script says connected");
+  assert.match(U.run1.out, /^connected: this machine is "nat-1" at https:\/\/127\.0\.0\.1:\d+, and the connector logged in through the tunnel as \S+ on \S+\. /m, U.run1.out);
+  assert.match(U.run1.out, /^  added the connector's key to /m);
+  const kexSaid = (/the tunnel's key exchange is (\S+) \(post-quantum\)/.exec(U.run1.out) ?? [])[1];
+  assert.ok(PQ_HERE.includes(kexSaid), U.run1.out);
+
+  const h = uHosts()["nat-1"];
+  assert.ok(h.port >= 20200 && h.port <= 20999, JSON.stringify(h));
+  assert.deepEqual({ ...h, port: 0, tunnel: { ...h.tunnel, id: "", key: "" } },
+    { host: "127.0.0.1", port: 0, username: ME, privateKeyPath: path.join(U.state, "keys", "id_ed25519"), hostFingerprint: U.target.fp, tunnel: { id: "", key: "", to: U.target.port } });
+  assert.match(h.tunnel.id, /^[0-9a-f]{32}$/);
+  assert.notEqual(h.tunnel.id, U.link, "the tunnel's own address is not the link's");
+  assert.equal(h.tunnel.key, readFileSync(path.join(U.m1, "key.pub"), "utf8").trim().split(" ").slice(0, 2).join(" "));
+  assert.equal(tunnelKeys(), `restrict,port-forwarding,permitlisten="127.0.0.1:${h.port}" ${h.tunnel.key} ssh-mcp:nat-1\n`, "that key, for that port, and no other");
+  const lines = readFileSync(U.target.authorized, "utf8").split("\n");
+  assert.ok(lines.includes(someone), "the key that was there is untouched");
+  assert.ok(lines.some((l) => l.startsWith(U.connectorPub().split(" ").slice(0, 2).join(" "))), "and the connector's key is on a line of its own");
+  assert.equal(existsSync(path.join(U.state, "tunnel", `${U.link}.json`)), false, "the link is gone");
+  U.h1 = h;
+
+  const ls = (await call("list_hosts", {}, U.base)).text;
+  const shown = new RegExp(`^nat-1: ${ME}@127\\.0\\.0\\.1:${h.port} \\(reverse tunnel: open, post-quantum key exchange (\\S+)\\)$`, "m").exec(ls);
+  assert.ok(shown && shown[1] === kexSaid, ls);
+
+  const mark = U.target.mark();
+  assert.equal((await call("bash", { host: "nat-1", command: "echo via-tunnel; id -un" }, U.base)).text, `via-tunnel\n${ME}\n`);
+  const f = P("u2.txt");
+  assert.equal((await call("write", { host: "nat-1", file_path: f, content: "through the tunnel\n" }, U.base)).isError, false);
+  assert.match((await call("read", { host: "nat-1", file_path: f }, U.base)).text, /through the tunnel/);
+  assert.match((await call("sftp_list", { host: "nat-1", path: TMP }, U.base)).text, /u2\.txt/);
+  const many = await call("ssh_exec_many", { host: "nat-1", commands: [0, 1, 2].map((n) => ({ id: `t${n}`, command: `sleep 0.3; echo par-${n}` })) }, U.base);
+  assert.equal(count(many.text, /exit: 0/g), 3, many.text);
+  // the machine's SSH server saw those logins arrive on its own loopback address: from the tunnel's end there
+  const log = U.target.since(mark), seen = wire(log);
+  assert.ok(seen.length >= 4 && seen.every((c) => c.on === "127.0.0.1"), JSON.stringify(seen));
+  assert.ok(count(log, /^Accepted publickey for /gm) >= 7, log);
+  assert.equal(openTunnels(), 1, "one tunnel");
+});
+
+test("U3 the tunnel's key can do nothing but that tunnel: no command, no other port, no forwarding into this machine, no classical key exchange - and no other key gets in", { skip: NO_TUNNEL }, async () => {
+  // the machine's own ssh configuration, without its forward (and, for one case, with another key)
+  const variant = (name, change) => {
+    const file = path.join(U.m1, name);
+    writeFileSync(file, change(readFileSync(path.join(U.m1, "ssh_config"), "utf8").replace(/^  RemoteForward .*\n/m, "")));
+    return file;
+  };
+  const bare = variant("ssh_config.bare", (t) => t);
+  // each attempt is over at the connector too before the next one starts: an address takes at most 3 connections at a time
+  const settle = () => until(() => openTunnels() <= 1, 15_000, "the attempt is over at the connector");
+  const ssh = async (cfg, args, ms = 20_000) => {
+    await settle();
+    const r = await new Promise((res) => execFile("ssh", ["-F", cfg, "-o", "LogLevel=INFO", ...args, "ssh-mcp-tunnel"], { env: machineEnv(), timeout: ms },
+      (err, stdout, stderr) => res({ code: err ? (err.code ?? "?") : 0, out: `${stdout}${stderr}` })));
+    await settle();
+    return r;
+  };
+
+  const cmd = await ssh(bare, ["id"]);
+  assert.notEqual(cmd.code, 0, cmd.out);
+  assert.doesNotMatch(cmd.out, /uid=/);
+  for (const spec of [`127.0.0.1:${U.h1.port + 1}:127.0.0.1:${U.target.port}`, `0.0.0.0:${U.h1.port + 1}:127.0.0.1:${U.target.port}`, `${U.h1.port + 2}:127.0.0.1:${U.target.port}`]) {
+    const other = await ssh(bare, ["-N", "-o", "ExitOnForwardFailure=yes", "-R", spec]);
+    assert.match(other.out, /remote port forwarding failed/, `${spec}: ${other.out}`);
+  }
+  const lport = await freePort();
+  await settle();
+  const l = background("ssh", ["-F", bare, "-o", "LogLevel=INFO", "-N", "-L", `127.0.0.1:${lport}:127.0.0.1:${U.port}`, "ssh-mcp-tunnel"], machineEnv());
+  await until(() => new Promise((r) => { const c = net.connect(lport, "127.0.0.1", () => { c.destroy(); r(true); }); c.on("error", () => r(false)); }), 20_000, "the local forward is listening");
+  const through = await fetch(`http://127.0.0.1:${lport}/`).then((r) => r.status, () => "nothing");
+  assert.equal(through, "nothing", "nothing reaches this machine through the tunnel's key");
+  await until(() => /administratively prohibited/.test(l.out), 10_000, "sshd says no");
+  l.stop();
+  const classical = await ssh(bare, ["-N", "-o", "KexAlgorithms=curve25519-sha256"]);
+  assert.notEqual(classical.code, 0);
+  assert.match(classical.out, /no matching key exchange method found|Unable to negotiate|kex_exchange_identification|Connection closed/i, classical.out);
+  const stranger = P("u-stranger");
+  execFileSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", stranger]);
+  const strangerCfg = variant("ssh_config.stranger", (t) => t.replace(/^  IdentityFile .*$/m, `  IdentityFile ${stranger}`));
+  const other = await ssh(strangerCfg, ["-N"]);
+  assert.notEqual(other.code, 0);
+  assert.match(other.out, /Permission denied/, other.out);
+
+  // and nothing answers there but on a tunnel's own address, with the upgrade it asks for
+  assert.equal(await upgradeStatus(U.port, randomBytes(16).toString("hex")), "HTTP/1.1 404 Not Found");
+  assert.equal(await upgradeStatus(U.port, U.h1.tunnel.id, "websocket"), "HTTP/1.1 404 Not Found");
+  assert.equal((await fetch(`${U.http}/t/${U.h1.tunnel.id}`)).status, 404, "a plain request for a tunnel address gets nothing either");
+  // each login with the machine's own key above counted as the machine coming back, and ended the tunnel it had open;
+  // its service (here: the script's loop) opens it again within a second
+  await until(tunnelIsOpen, 20_000, "the machine's tunnel is open again");
+  await until(() => openTunnels() === 1, 10_000, "none of those attempts left a tunnel open");
+  assert.equal((await call("bash", { host: "nat-1", command: "echo still-fine" }, U.base)).text, "still-fine\n");
+});
+
+test("U4 a link is good once: used up, it answers nothing; taken by one machine, it refuses another; run out, its key goes", { skip: NO_TUNNEL }, async () => {
+  assert.equal((await fetch(`${U.http}/t/${U.link}`)).status, 404, "the link nat-1 came in with");
+  const hostPub = execFileSync("ssh-keygen", ["-y", "-f", path.join(U.target.dir, "host-a")]).toString().trim();
+  const mk = () => { const f = P(`u4-${hex()}`); execFileSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", f]); return readFileSync(`${f}.pub`, "utf8").trim().split(" ").slice(0, 2).join(" "); };
+  const keyA = mk(), keyB = mk();
+  const body = (key) => `key ${key}\nhostkey ${hostPub}\nhostname m2\nclient OpenSSH_test\n`;
+  const send = async (id, key) => { const r = await fetch(`${U.http}/t/${id}`, { method: "POST", body: body(key) }); return [r.status, await r.text()]; };
+  assert.equal((await send(U.link, keyA))[0], 404);
+
+  const r = await call("add_host", { name: "nat-2", tunnel: true, username: ME, port: U.target.port }, U.base);
+  const id = linkIn(r.text);
+  const [s1, a1] = await send(id, keyA);
+  assert.equal(s1, 200, a1);
+  assert.match(a1, new RegExp(`^port=\\d+\\nid=[0-9a-f]{32}\\nuser=${ME}\\n$`));
+  assert.deepEqual(await send(id, keyB), [409, "This link was already used by another machine.\n"]);
+  assert.deepEqual(await send(id, keyA), [200, a1], "the same machine asking again (a retry) gets the same answer");
+  const port2 = Number(/^port=(\d+)$/m.exec(a1)[1]);
+  assert.notEqual(port2, U.h1.port);
+  assert.ok(tunnelKeys().includes(`restrict,port-forwarding,permitlisten="127.0.0.1:${port2}" ${keyA} ssh-mcp:nat-2\n`), "its key is in, for its own port, while it comes in");
+  assert.deepEqual(await send(id, U.h1.tunnel.key), [409, "This link was already used by another machine.\n"]);
+
+  // made to run out: the link answers nothing, and the key it brought goes at the next look
+  const file = path.join(U.state, "tunnel", `${id}.json`);
+  writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, "utf8")), exp: Date.now() - 1000 }));
+  assert.equal((await fetch(`${U.http}/t/${id}`)).status, 404);
+  assert.equal((await call("add_host", { name: "nat-3", tunnel: true, username: ME }, U.base)).isError, false);
+  assert.equal(tunnelKeys().includes("ssh-mcp:nat-2"), false);
+  assert.equal(existsSync(file), false);
+
+  // a machine whose host keys do not include the fingerprint add_host was given
+  const r4 = await call("add_host", { name: "nat-4", tunnel: true, username: ME, fingerprint: `SHA256:${"A".repeat(43)}` }, U.base);
+  const [s4, a4] = await send(linkIn(r4.text), keyB);
+  assert.equal(s4, 409);
+  assert.match(a4, /^None of this machine's SSH host keys has the fingerprint add_host was given/);
+  // a machine that already comes in under another name
+  const r5 = await call("add_host", { name: "nat-5", tunnel: true, username: ME }, U.base);
+  const [s5, a5] = await send(linkIn(r5.text), U.h1.tunnel.key);
+  assert.equal(s5, 409);
+  assert.match(a5, /already comes in as "nat-1"/);
+  // nonsense
+  const r6 = await call("add_host", { name: "nat-6", tunnel: true, username: ME }, U.base), id6 = linkIn(r6.text);
+  for (const junk of ["", "key ssh-rsa AAAA\nhostkey x\n", `key ${keyB}\n`, `key ${keyB}\nhostkey garbage here\n`]) {
+    const x = await fetch(`${U.http}/t/${id6}`, { method: "POST", body: junk });
+    assert.equal(x.status, 400, junk);
+  }
+  assert.deepEqual(Object.keys(uHosts()).sort(), ["local", "nat-1"]);
+});
+
+test("U5 a tunnel that is down is said to be down; the machine coming back brings the calls back - and what it left open is closed at once, not after a timeout", { skip: NO_TUNNEL }, async () => {
+  U.run1.stop(); // the machine is gone: all its processes, and with them the HTTPS connection
+  await until(async () => /^nat-1: .* \(reverse tunnel: not open\)$/m.test((await call("list_hosts", {}, U.base)).text), 15_000, "list_hosts says the tunnel is not open");
+  const down = await call("bash", { host: "nat-1", command: "echo x" }, U.base);
+  assert.equal(down.isError, true);
+  assert.match(down.text, /"nat-1" is reached through a tunnel that it opens itself, and that tunnel is not open: .*systemctl status ssh-mcp-tunnel/, down.text);
+  assert.equal(openTunnels(), 0);
+
+  // back, as its service would bring it back, from the files the script left
+  const back = tunnelFrom(U.m1);
+  await until(tunnelIsOpen, 30_000, "open again");
+  assert.equal((await call("bash", { host: "nat-1", command: "echo back" }, U.base)).text, "back\n");
+
+  // its network goes away without a word (frozen), and it comes back on a new connection: the connector does not
+  // wait for the silent one to time out (it would hold the port for about 45 s) - the new login ends it
+  process.kill(back.proc.pid, "SIGSTOP");
+  const t0 = Date.now(), again = tunnelFrom(U.m1, true);
+  await until(async () => (await call("bash", { host: "nat-1", command: "echo again" }, U.base)).text === "again\n", 30_000, "calls work through the new tunnel");
+  await until(() => openTunnels() === 1, 5_000, "the silent one is closed");
+  assert.ok(Date.now() - t0 < 20_000, `took ${Date.now() - t0} ms`);
+  process.kill(back.proc.pid, "SIGCONT");
+  back.stop();
+  U.again = again;
+
+  // each tunnel that ended is on record: the ones that were in with their key exchange, the refused ones (U3) with the reason
+  const ended = auditEntries(U.audit).filter((e) => e.tool === "tunnel" && e.host === "nat-1" && e.done);
+  const was = ended.filter((e) => e.ok), refused = ended.filter((e) => !e.ok);
+  assert.ok(was.length >= 3 && was.every((e) => PQ_HERE.includes(e.kex) && e.via === "tunnel"), JSON.stringify(was));
+  assert.ok(refused.length >= 2 && refused.every((e) => e.err), JSON.stringify(refused));
+  assert.ok(refused.some((e) => /no matching key exchange|Unable to negotiate/i.test(e.err)), JSON.stringify(refused.map((e) => e.err)));
+});
+
+test("U6 add_host again with replace: true lets a new machine take the name; the old one works until then, and its key and address stop working at once", { skip: NO_TUNNEL }, async () => {
+  const old = uHosts()["nat-1"];
+  const taken = await call("add_host", { name: "nat-1", tunnel: true, username: ME, port: U.target.port }, U.base);
+  assert.equal(taken.isError, true);
+  assert.match(taken.text, /already exists/);
+  const r = await call("add_host", { name: "nat-1", tunnel: true, replace: true, username: ME, port: U.target.port }, U.base);
+  const script = await (await fetch(`${U.http}/t/${linkIn(r.text)}`)).text();
+  assert.equal((await call("bash", { host: "nat-1", command: "echo old-still" }, U.base)).text, "old-still\n", "until the new machine is in, the old one is nat-1");
+
+  const run = runScript(script, P("u-machine-2"));
+  await until(() => /^connected: /m.test(run.out) || run.proc.exitCode !== null, 90_000, "the second machine says connected");
+  assert.match(run.out, /^connected: this machine is "nat-1"/m, run.out);
+  const now = uHosts()["nat-1"];
+  assert.notEqual(now.tunnel.id, old.tunnel.id);
+  assert.notEqual(now.tunnel.key, old.tunnel.key);
+  assert.equal(count(tunnelKeys(), /ssh-mcp:nat-1$/gm), 1);
+  assert.ok(tunnelKeys().includes(now.tunnel.key) && !tunnelKeys().includes(old.tunnel.key), tunnelKeys());
+  assert.equal((await call("bash", { host: "nat-1", command: "echo new-one" }, U.base)).text, "new-one\n");
+  // the old machine's tunnel was ended, and its address leads nowhere now (its service keeps knocking, in vain)
+  assert.equal(await upgradeStatus(U.port, old.tunnel.id), "HTTP/1.1 404 Not Found");
+  await until(() => openTunnels() === 1, 10_000, "only the new machine's tunnel is open");
+  U.again.stop();
+  U.run2 = run;
+});
+
+test("U7 the audit log has every step: the link handed out and read, the machine calling in and coming in, and each tunnel", { skip: NO_TUNNEL }, async () => {
+  const es = auditEntries(U.audit).filter((e) => e.done);
+  const of = (tool) => es.filter((e) => e.tool === tool);
+  assert.ok(of("add_host").some((e) => e.tunnel === true && e.added === false), "add_host handing out a link");
+  for (const tool of ["tunnel.link", "tunnel.enroll", "tunnel.up"]) {
+    assert.ok(of(tool).some((e) => e.host === "nat-1" && e.ok && e.via === "tunnel"), tool);
+  }
+  assert.ok(of("tunnel.up").some((e) => e.ok && e.added === true && e.fp === U.target.fp && PQ_HERE.includes(e.kex)), JSON.stringify(of("tunnel.up")));
+  assert.ok(of("tunnel.enroll").some((e) => !e.ok && /already used by another machine/.test(e.err)), "a refusal, with its reason");
+  const shown = (await call("audit", { contains: "tunnel.up", limit: 10 }, U.base)).text;
+  assert.match(shown, /  tunnel  tunnel\.up  nat-1 \(pq\)  ok \(added\)  /, shown);
+});
+
+test("U8 when the connector goes away (a restart), the machine's end notices at once - not at its next keepalive, 15 s later - and comes back by itself", { skip: NO_TUNNEL }, async () => {
+  const m2 = P("u-machine-2"), safe = async (f) => { try { return await f(); } catch { return false; } };
+  U.run2.stop();
+  await until(async () => !(await safe(tunnelIsOpen)), 15_000, "machine 2's tunnel is closed");
+  const one = tunnelFrom(m2); // one ssh, as the service runs it
+  await until(() => safe(tunnelIsOpen), 30_000, "open");
+  let ended = null;
+  one.proc.on("exit", () => { ended = Date.now(); });
+  const t0 = Date.now();
+  U.server.kill("SIGKILL");
+  await until(() => ended !== null, 20_000, "the machine's ssh ends");
+  assert.ok(ended - t0 < 5000, `the machine's ssh ended ${ended - t0} ms after the connector went away`);
+  // the connector is back, and so is the tunnel, as its service brings it back
+  U.server = await startServer(U.port, U.env);
+  U.run2 = tunnelFrom(m2, true);
+  await until(() => safe(tunnelIsOpen), 30_000, "open again");
+  assert.equal((await call("bash", { host: "nat-1", command: "echo after-restart" }, U.base)).text, "after-restart\n");
+});
+
+test("U9 the same machine running a new link (replace: true - to bring its tunnel up to date, say) comes back on its new port, with the key it has", { skip: NO_TUNNEL }, async () => {
+  const m2 = P("u-machine-2"), before = uHosts()["nat-1"];
+  const r = await call("add_host", { name: "nat-1", tunnel: true, replace: true, username: ME, port: U.target.port }, U.base);
+  const script = await (await fetch(`${U.http}/t/${linkIn(r.text)}`)).text();
+  U.run2.stop(); // as the script restarts the service on a real machine
+  const run = runScript(script, m2);
+  await until(() => /^connected: /m.test(run.out) || run.proc.exitCode !== null, 90_000, "connected again");
+  assert.match(run.out, /^connected: this machine is "nat-1"/m, run.out);
+  const after = uHosts()["nat-1"];
+  assert.equal(after.tunnel.key, before.tunnel.key, "the key it had");
+  assert.notEqual(after.port, before.port, "a port of its own for the new tunnel");
+  assert.notEqual(after.tunnel.id, before.tunnel.id);
+  assert.equal(tunnelKeys(), `restrict,port-forwarding,permitlisten="127.0.0.1:${after.port}" ${after.tunnel.key} ssh-mcp:nat-1\n`, "one line, for the new port only");
+  assert.equal((await call("bash", { host: "nat-1", command: "echo renewed" }, U.base)).text, "renewed\n");
+  assert.equal(await upgradeStatus(U.port, before.tunnel.id), "HTTP/1.1 404 Not Found");
+  U.run2 = run;
+});
+
+test("U10 TUNNEL=off: no links are handed out, and no tunnel is taken", { skip: NO_TUNNEL }, async () => {
+  const port = await freePort(), base = `http://127.0.0.1:${port}/mcp/${SECRET}`;
+  await startServer(port, { ...U.env, TUNNEL: "off" });
+  const r = await call("add_host", { name: "nat-off", tunnel: true, username: ME }, base);
+  assert.equal(r.isError, true);
+  assert.match(r.text, /TUNNEL=off/);
+  assert.equal(await upgradeStatus(port, uHosts()["nat-1"].tunnel.id), "HTTP/1.1 404 Not Found");
+  assert.match((await call("list_hosts", {}, base)).text, /^nat-1: .* \(reverse tunnel: turned off on this connector, TUNNEL=off\)$/m);
+  U.run2.stop();
 });

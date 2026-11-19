@@ -68,6 +68,7 @@ if [ "$part" = all ] || [ "$part" = setup ]; then
   ss -ltnH "sport = :$PORT" | grep -q . && { echo "port $PORT is in use - not starting the rehearsal"; exit 1; }
   mkdir -p $R/log
   cp $LIVE/server.ts $LIVE/package.json $LIVE/box.sh $R/      # the live file ...
+  [ -f $LIVE/tunnel.sh ] && cp $LIVE/tunnel.sh $R/                          # (1.8: the script add_host's tunnel links serve)
   cp $LIVE/server.new.ts $R/server.good.ts                                  # ... and the new build
   ln -s $LIVE/node_modules $R/node_modules
   echo '{ "local": { "local": true } }' > $R/hosts.json

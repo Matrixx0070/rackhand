@@ -94,6 +94,7 @@ say "start${DRY:+ (dry run)} for $SVC on :$PORT in $APP (UNITFIX=$UNITFIX); tool
 [ -r "$CG/cgroup.procs" ] || abort "no cgroup $CG"
 [ -x "$NODE" ] || abort "no node at $NODE"
 case " $EXPECT " in *" bridge "*) [ -s box.sh ] || abort "no box.sh next to server.ts (the bridge serves it)";; esac
+if grep -q 'tunnel\.sh' server.new.ts; then [ -s tunnel.sh ] || abort "no tunnel.sh next to server.ts (add_host with tunnel: true serves it)"; fi
 case "$(cat /proc/$$/cgroup)" in *"/$SVC.service"*) abort "running inside $SVC.service";; esac
 [ -z "$DRY" ] && sleep 2      # let the call that launched us return first
 

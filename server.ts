@@ -6,10 +6,12 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { Client, type ClientChannel, type ConnectConfig, type ParsedKey, type SFTPWrapper } from "ssh2";
 import { exec, execFile, spawn } from "node:child_process";
-import { readFileSync, promises as fs } from "node:fs";
+import { readFileSync, constants as fsc, promises as fs } from "node:fs";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { homedir, hostname } from "node:os";
+import { homedir, hostname, userInfo } from "node:os";
+import { createServer as netServer, type Socket } from "node:net";
+import type { IncomingMessage } from "node:http";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { Duplex, PassThrough, Transform, type Readable, type Writable } from "node:stream";
 import { createRequire } from "node:module";
@@ -23,7 +25,7 @@ const HOSTS_FILE = process.env.HOSTS_FILE ?? "./hosts.json";
 const MAX_OUT = 100_000;
 const JOBS_DIR = process.env.JOBS_DIR ?? "/var/lib/ssh-mcp/jobs"; // ssh_spawn: <jobId>.log / .exit / .pid / .cmd / .sh
 const MAX_PAYLOAD = 64 * 1024; // bytes of command/code sent inline (base64) in one shell argument
-const VERSION = "1.7.0";
+const VERSION = "1.8.0";
 // Sent to the client at initialize; clients put it in front of the model. Keep it short: it costs tokens in every conversation.
 const INSTRUCTIONS = `Remote shell and files on the hosts from list_hosts ("local" = the machine this connector runs on).
 Every tool call is a round trip, so do as much as possible per call:
@@ -33,7 +35,7 @@ Every tool call is a round trip, so do as much as possible per call:
 - bash: join steps with && or newlines instead of separate calls; pass quiet: true when only success or failure matters (the full output stays in a file on the host); use run_in_background plus ssh_job (wait) for anything that takes more than a minute.
 - bridge: large, binary or many files, moved directly from a sandbox shell.
 - audit: the log of every call made through this connector, from any chat or client.
-- add_host: connect another server (it tells you what to do on that server).
+- add_host: connect another server (it tells you what to do on that server); tunnel: true for one this connector cannot reach.
 A few catastrophic commands (deleting /, formatting a disk, powering off) are refused unless the call says confirm: true; only pass it when the user really wants that.
 bash starts in the home directory unless cwd or a session is given.`;
 
@@ -51,6 +53,8 @@ type HostCfg = {
   pq?: boolean;             // v1.6: true = post-quantum key exchange on the wire (see below); false = add_host found it impossible
   pqWhy?: string;           //       ... and why
   pqVia?: string;           //       where that server's SSH is as the server itself sees it ("ip:port"), when it is not 127.0.0.1:<port>
+  tunnel?: { id: string; key: string; to: number }; // v1.8: the host comes in through a tunnel it opens itself (see below): id = the
+                            //       secret part of its address here, key = its tunnel key ("ssh-ed25519 AAAA..."), to = its SSH port there
 };
 
 const loadHosts = (): Record<string, HostCfg> => JSON.parse(readFileSync(HOSTS_FILE, "utf8"));
@@ -259,7 +263,8 @@ function pqShared(id: string, gate: string, o: PqTarget & { via: string; private
     },
   };
   list.push(s);
-  s.ready = pqGate(gate, () => carried(o)).then(({ client, kex }) => { s.client = client; s.kex = kex; client.on("close", s.retire); }, (e) => { s.retire(); throw e; });
+  // "end": the connection is going (its carrier's output has ended), and from then on ssh2 refuses to start anything on it
+  s.ready = pqGate(gate, () => carried(o)).then(({ client, kex }) => { s.client = client; s.kex = kex; client.on("end", s.retire).on("close", s.retire); }, (e) => { s.retire(); throw e; });
   s.ready.catch(() => {}); // whoever waits for it gets the reason; nobody waiting is not an error
   return s;
 }
@@ -281,7 +286,7 @@ function pqLeaseOn(first: Shared, id: string, another: () => Promise<Shared>, ex
     shut: (ch: T) => void, cb: (err: Error | undefined, ch: T) => void, again = true): void => {
     if (done) return void cb(new Error("this connection was already given back"), undefined as never);
     const on = cur;
-    start(on.client!, (err, ch) => {
+    const got = (err: Error | undefined, ch: T): void => {
       if (err) {
         if (!again || opened > 0 || done) return void cb(err, ch);
         if ((err as { reason?: unknown }).reason === undefined) on.retire(); // it stands, but starts nothing any more: no further call is put on it
@@ -302,7 +307,9 @@ function pqLeaseOn(first: Shared, id: string, another: () => Promise<Shared>, ex
       ch.once("close", () => mine.delete(close));
       if (done) close(); // the caller gave up while the channel was being opened
       cb(undefined, ch);
-    });
+    };
+    // ssh2 throws instead of calling back when the connection has just gone ("Not connected"): the same as any failure to start
+    try { start(on.client!, got); } catch (e) { got(e instanceof Error ? e : new Error(String(e)), undefined as never); }
   };
   const finish = () => {
     if (done) return;
@@ -353,7 +360,7 @@ async function connect(cfg: HostCfg, name = ""): Promise<Conn> {
     try { return await pqLease(cfg, label); }
     catch (e) { throw isPqFail(e) ? pqError(label, cfg, e) : e; }
   }
-  if (PQ_MODE === "require") throw new Error(`"${label}" is not a post-quantum host, and this connector only connects to hosts that are (PQ_SSH=require). Add it again with add_host (replace: true): that tries post-quantum key exchange first.`);
+  if (PQ_MODE === "require" && !cfg.tunnel) throw new Error(`"${label}" is not a post-quantum host, and this connector only connects to hosts that are (PQ_SSH=require). Add it again with add_host (replace: true): that tries post-quantum key exchange first.`);
   const opts: ConnectConfig = {
     host: cfg.host,
     port: cfg.port ?? 22,
@@ -371,7 +378,9 @@ async function connect(cfg: HostCfg, name = ""): Promise<Conn> {
   }
   return new Promise<Conn>((resolve, reject) => {
     const c = new Client();
-    c.on("ready", () => resolve(c)).on("error", reject).connect(opts);
+    c.on("ready", () => resolve(c))
+      .on("error", (e: Error) => reject(cfg.tunnel && /ECONNREFUSED/.test(e.message) ? tunnelClosed(label) : e))
+      .connect(opts);
   });
 }
 
@@ -534,10 +543,14 @@ function jobScript(id: string, action: JobAction, bytes: number, timeoutSec: num
   const tail = `echo "--- log (last ${bytes} bytes) ---"\ntail -c ${bytes} "$D/$id.log" 2>/dev/null\n`;
   if (action === "status") return `${head}jprint "$id"\n`;
   if (action === "tail") return `${head}jprint "$id"\n${tail}`;
+  // whole seconds slept, counted: bash's $SECONDS counts second boundaries crossed, and a shell that starts late in a
+  // second can see 2 of them after one second
   if (action === "wait") return `${head}
-while [ ! -f "$D/$id.exit" ] && [ "$SECONDS" -lt ${timeoutSec} ]; do
+n=0
+while [ ! -f "$D/$id.exit" ] && [ "$n" -lt ${timeoutSec} ]; do
   alive "$(cat "$D/$id.pid" 2>/dev/null)" "$id" || break
   sleep 1
+  n=$((n + 1))
 done
 jprint "$id"
 [ "$st" = running ] && echo "note: still running after ${timeoutSec}s - call wait again"
@@ -835,9 +848,9 @@ function bridgeTokenOk(token: string): boolean {
 // File contents are never logged, only paths and sizes. Commands are logged after masking what looks like a
 // credential: best effort, not a guarantee. The log lives on the machine it describes, so whoever holds the
 // connector URL can also delete it; forward it somewhere else if it has to survive that.
-type Who = { via: "mcp" | "bridge"; ip: string; ua?: string; tok?: string };
+type Who = { via: "mcp" | "bridge" | "tunnel"; ip: string; ua?: string; tok?: string };
 type AuditInfo = { host?: string; what?: string; bytes?: number; cwd?: string; bg?: boolean; batch?: string };
-type AuditEnd = { ok: boolean; err?: string; exit?: number | null; bytes?: number };
+type AuditEnd = { ok: boolean; err?: string; exit?: number | null; bytes?: number; kex?: string };
 type Args = Record<string, any>; // tool arguments (already validated against the tool's schema) or a parsed log line
 
 const envNum = (name: string, dflt: number) => { const v = process.env[name]; const n = v === undefined || v.trim() === "" ? NaN : Number(v); return Number.isFinite(n) ? n : dflt; };
@@ -866,13 +879,13 @@ const auditText = (s: string, max = AUDIT_CLIP) => {
 
 // Who is calling. Behind the reverse proxy the peer is always loopback, and the right-most X-Forwarded-For
 // entry is the address the proxy itself saw (entries further left are whatever the client chose to send).
-function whoOf(req: express.Request): Who {
+function whoOf(req: express.Request | IncomingMessage, via?: Who["via"]): Who {
   const peer = (req.socket.remoteAddress ?? "").replace(/^::ffff:/, "");
   const fwd = String(req.headers["x-forwarded-for"] ?? "").split(",").map((x) => x.trim()).filter(Boolean);
   const ip = (peer === "127.0.0.1" || peer === "::1") && fwd.length ? fwd[fwd.length - 1] : peer;
   const ua = String(req.headers["user-agent"] ?? "").replace(/[^\x20-\x7e]/g, "").slice(0, 120);
-  const token = (req.params as Record<string, string>).token; // set on /b/:token/... routes
-  return { via: token ? "bridge" : "mcp", ip: /^[0-9A-Fa-f:.]{2,45}$/.test(ip) ? ip : "?", ...(ua ? { ua } : {}), ...(token ? { tok: token.split(".")[0] } : {}) };
+  const token = ((req as express.Request).params as Record<string, string> | undefined)?.token; // set on /b/:token/... routes
+  return { via: via ?? (token ? "bridge" : "mcp"), ip: /^[0-9A-Fa-f:.]{2,45}$/.test(ip) ? ip : "?", ...(ua ? { ua } : {}), ...(token ? { tok: token.split(".")[0] } : {}) };
 }
 
 async function auditRotate(): Promise<void> {
@@ -1363,6 +1376,261 @@ const whoIs = (c: Client, fallback: string): Promise<string> => new Promise((res
 }));
 const hostKeyFileOf = (type = "") => (type.startsWith("ecdsa") ? "ssh_host_ecdsa_key.pub" : /rsa/.test(type) ? "ssh_host_rsa_key.pub" : "ssh_host_ed25519_key.pub");
 
+// hosts.json, rewritten as a whole - all or nothing - with the previous version kept as hosts.json.bak. Call it inside serial().
+async function updateHosts(change: (all: Record<string, HostCfg>) => void): Promise<void> {
+  const before = await fs.readFile(HOSTS_FILE, "utf8"), all = JSON.parse(before) as Record<string, HostCfg>;
+  change(all);
+  await fs.writeFile(`${HOSTS_FILE}.bak`, before, { mode: 0o600 });
+  await fs.writeFile(`${HOSTS_FILE}.new`, `${JSON.stringify(all, null, 2)}\n`, { mode: 0o600 });
+  await fs.chmod(`${HOSTS_FILE}.new`, 0o600);
+  await fs.rename(`${HOSTS_FILE}.new`, HOSTS_FILE);
+}
+
+// ── v1.8: tunnels, for machines this connector cannot reach ──────────────────────────────────────────────────
+// A machine behind NAT or a firewall is not connected to: it connects. add_host with tunnel: true hands out a link
+// that works once; the script behind it (tunnel.sh), run as root on that machine, lets this connector's key log in
+// there, makes a key for the tunnel and installs the service ssh-mcp-tunnel. That service keeps an SSH connection
+// open to this connector, carried over HTTPS - the port that is reachable anyway, so nothing new has to be reachable
+// on either side - and asks it for one remote forward: 127.0.0.1:<port> here leads to that machine's own SSH server.
+// From then on the host is 127.0.0.1:<port> for every tool, its host key pinned like any other's.
+// The SSH server at this end is started for each tunnel (sshd -i, fed the upgraded HTTPS connection), with a
+// configuration that allows that and nothing else: post-quantum key exchange only, no shell, no command, no forwarding
+// but the one remote forward, each key bound to its own port, logged in as an account of its own (TUNNEL_USER: when
+// this runs as root, sshmcp-tunnel, created when first needed). TUNNEL=off turns all of it off.
+const TUNNEL_OFF = /^(off|0|false|no)$/i.test(process.env.TUNNEL ?? "");
+const RUN_AS = userInfo().username, AS_ROOT = process.getuid?.() === 0;
+const TUNNEL_USER = process.env.TUNNEL_USER ?? (AS_ROOT ? "sshmcp-tunnel" : RUN_AS);
+const STATE_DIR = dirname(JOBS_DIR);
+// sshd reads it as TUNNEL_USER, so it is not in the private state: nothing in it is secret but the host key (mode 600)
+const TUNNEL_DIR = resolvePath(process.env.TUNNEL_DIR ?? `${STATE_DIR}-tunnel`);
+const LINKS_DIR = join(STATE_DIR, "tunnel"); // the links add_host hands out: private, like the rest of the state
+const TUNNEL_PORTS = ((m) => (m ? [Number(m[1]), Number(m[2])] : [20200, 20999]))(/^(\d{4,5})-(\d{4,5})$/.exec(process.env.TUNNEL_PORTS ?? ""));
+const LINK_MS = 30 * 60_000, TUNNELS_MAX = 64;
+const isLinkId = (s: string) => /^[0-9a-f]{32}$/.test(s);
+const sameId = (a: string, b: string) => a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
+const keyFpOf = (line: string) => fingerprintOf(Buffer.from(line.split(" ")[1] ?? "", "base64"));
+const runFile = (file: string, args: string[], timeout = 20_000) => new Promise<{ ok: boolean; out: string }>((res) =>
+  execFile(file, args, { timeout }, (err, stdout, stderr) => res({ ok: !err, out: `${stdout}${stderr}`.trim() || (err ? err.message : "") })));
+async function executable(files: Array<string | undefined>): Promise<string | null> {
+  for (const f of files) if (f && (await fs.access(f, fsc.X_OK).then(() => true, () => false))) return f;
+  return null;
+}
+const tunnelClosed = (label: string) => new Error(`"${label}" is reached through a tunnel that it opens itself, and that tunnel is not open: ` +
+  `the machine is off or offline, or its service ssh-mcp-tunnel is not running (there: systemctl status ssh-mcp-tunnel)` +
+  `${TUNNEL_OFF ? ". Besides, tunnels are turned off on this connector (TUNNEL=off)" : ""}.`);
+
+// A link, from add_host until the machine is in; once the machine has called on it (POST /t/<link>), with what it sent.
+type Link = { name: string; username: string; to: number; fingerprint?: string; replace?: boolean; exp: number;
+  key?: string; hostKeys?: string[]; hostname?: string; client?: string; port?: number; id?: string };
+const linkFile = (id: string) => join(LINKS_DIR, `${id}.json`);
+async function linkOf(id: string): Promise<Link | null> {
+  if (!isLinkId(id)) return null;
+  const l = await fs.readFile(linkFile(id), "utf8").then((t) => JSON.parse(t) as Link, () => null);
+  return l && l.exp > Date.now() ? l : null;
+}
+async function saveLink(id: string, l: Link): Promise<void> {
+  await mkdirp(LINKS_DIR);
+  await fs.chmod(LINKS_DIR, 0o700);
+  await fs.writeFile(`${linkFile(id)}.new`, JSON.stringify(l), { mode: 0o600 });
+  await fs.rename(`${linkFile(id)}.new`, linkFile(id));
+}
+async function allLinks(): Promise<Array<[string, Link]>> {
+  const out: Array<[string, Link]> = [];
+  for (const f of await fs.readdir(LINKS_DIR).catch(() => [] as string[])) {
+    const id = f.slice(0, -5);
+    if (!f.endsWith(".json") || !isLinkId(id)) continue;
+    const l = await fs.readFile(join(LINKS_DIR, f), "utf8").then((t) => JSON.parse(t) as Link, () => null);
+    if (l) out.push([id, l]);
+  }
+  return out;
+}
+
+// The SSH server end of the tunnels: its program, configuration and host key, made ready once (again after a failure).
+type TunnelEnd = { sshd: string; config: string; hostKey: string; kex: string[] };
+let tunnelEnd: Promise<TunnelEnd> | null = null;
+const tunnelReady = (): Promise<TunnelEnd> => (tunnelEnd ??= setUpTunnelEnd().catch((e) => { tunnelEnd = null; throw e; }));
+async function setUpTunnelEnd(): Promise<TunnelEnd> {
+  if (TUNNEL_OFF) throw new Error("tunnels are turned off on this connector (TUNNEL=off)");
+  const sshd = await executable([process.env.TUNNEL_SSHD, "/usr/sbin/sshd", "/usr/local/sbin/sshd", "/sbin/sshd"]);
+  if (!sshd) throw new Error("this machine has no OpenSSH server program (sshd), which takes the tunnels at this end: install openssh-server (it does not have to run as a service)");
+  const kex = await pqHere();
+  if (!kex.length) throw new Error("this machine's OpenSSH has no post-quantum key exchange, and a tunnel is only made with one (OpenSSH 9.0 and newer have it)");
+  // (by full path: the service's PATH has no sbin directories)
+  if (TUNNEL_USER !== RUN_AS && !(await runFile((await executable(["/usr/bin/id", "/bin/id"])) ?? "id", ["-u", TUNNEL_USER])).ok) {
+    if (!AS_ROOT) throw new Error(`the account ${TUNNEL_USER} (TUNNEL_USER), which tunnels log in as, does not exist, and only root can create it`);
+    const shell = (await executable(["/usr/sbin/nologin", "/sbin/nologin"])) ?? "/bin/false";
+    const useradd = await executable(["/usr/sbin/useradd", "/sbin/useradd", "/usr/bin/useradd"]);
+    if (!useradd) throw new Error(`the account ${TUNNEL_USER} (TUNNEL_USER), which tunnels log in as, does not exist, and there is no useradd here to create it: create it yourself (no password, no shell)`);
+    // password "*": none works, and unlike "!" it does not make OpenSSH take the account for a locked one
+    const made = await runFile(useradd, ["--system", "--no-create-home", "--home-dir", "/nonexistent", "--shell", shell, "--password", "*", "--comment", "ssh-mcp tunnels", TUNNEL_USER]);
+    if (!made.ok) throw new Error(`could not create the account ${TUNNEL_USER}, which tunnels log in as: ${made.out}`);
+  }
+  await mkdirp(TUNNEL_DIR);
+  await fs.chmod(TUNNEL_DIR, 0o755);
+  const keyPath = join(TUNNEL_DIR, "host_ed25519"), keys = join(TUNNEL_DIR, "authorized_keys"), config = join(TUNNEL_DIR, "sshd_config");
+  const made = (e: NodeJS.ErrnoException) => { if (e.code !== "EEXIST") throw e; }; // another process was quicker: use what it made
+  if (!(await fs.stat(keyPath).catch(() => null))) await fs.writeFile(keyPath, newKeyPair(`ssh-mcp-tunnel@${hostname()}`).private, { mode: 0o600, flag: "wx" }).catch(made);
+  const k = usableKey(await fs.readFile(keyPath));
+  if (!k) throw new Error(`the tunnels' host key ${keyPath} cannot be read`);
+  await fs.writeFile(keys, "", { mode: 0o644, flag: "wx" }).catch(made);
+  await fs.writeFile(`${config}.new`, [
+    `# Written by ssh-mcp ${VERSION}: the SSH server end of the tunnels that machines open to this connector.`,
+    "# It is not a daemon: the connector starts one for each tunnel (sshd -i), and it allows that tunnel and nothing else.",
+    `HostKey ${keyPath}`,
+    `AuthorizedKeysFile ${keys}`,
+    `AllowUsers ${TUNNEL_USER}`,
+    `PermitRootLogin ${TUNNEL_USER === "root" ? "prohibit-password" : "no"}`,
+    "AuthenticationMethods publickey", "PubkeyAuthentication yes", "PasswordAuthentication no", "KbdInteractiveAuthentication no", "HostbasedAuthentication no", "UsePAM no",
+    `KexAlgorithms ${kex.join(",")}`,
+    "MaxSessions 0", "AllowTcpForwarding remote", "PermitOpen none", "GatewayPorts no", "AllowStreamLocalForwarding no", "AllowAgentForwarding no",
+    "X11Forwarding no", "PermitTunnel no", "PermitTTY no", "PermitUserRC no", "PermitUserEnvironment no",
+    "StrictModes yes", "UseDNS no", "LoginGraceTime 30", "MaxAuthTries 3", "ClientAliveInterval 15", "ClientAliveCountMax 3",
+    "PidFile none", "LogLevel DEBUG1", "",
+  ].join("\n"), { mode: 0o644 });
+  await fs.rename(`${config}.new`, config);
+  if (AS_ROOT) await mkdirp("/run/sshd"); // its privilege separation directory, which otherwise only a running system sshd keeps
+  const check = await runFile(sshd, ["-t", "-f", config]);
+  if (!check.ok) throw new Error(`the tunnels' SSH server refused its configuration (${config}): ${check.out}`);
+  return { sshd, config, hostKey: `${k.type} ${k.getPublicSSH().toString("base64")}`, kex };
+}
+
+// The tunnels that are open now, by their address (one machine, whose reconnections can overlap for a moment).
+type OpenTunnel = { name: string; blob: string; since: number; kex: string; in: boolean; up: boolean; end(why: string): void };
+const tunnelsOpen = new Map<string, Set<OpenTunnel>>();
+const openTunnel = (id: string) => [...(tunnelsOpen.get(id) ?? [])].find((t) => t.up);
+
+// Brings the tunnels' authorized_keys in line with what is current - the tunnel hosts in hosts.json, and the links a
+// machine has called on that have not run out - and ends every open tunnel whose key is no longer in it. Links that
+// ran out are dropped. Call it inside serial().
+async function tunnelTidy(): Promise<void> {
+  // one line per key, allowing each port that key has now: a machine that runs a new link keeps its key, and needs its
+  // old port until it is in on the new one
+  const keys = new Map<string, { key: string; ports: Set<number>; names: Set<string> }>(); // by the key's base64
+  const add = (name: string, port: number, key: string) => {
+    const k = keys.get(key.split(" ")[1] ?? "") ?? { key, ports: new Set<number>(), names: new Set<string>() };
+    k.ports.add(port);
+    k.names.add(name);
+    keys.set(key.split(" ")[1] ?? "", k);
+  };
+  for (const [id, l] of await allLinks()) {
+    if (l.exp <= Date.now()) await fs.unlink(linkFile(id)).catch(() => {});
+    else if (l.key && l.port) add(l.name, l.port, l.key);
+  }
+  for (const [name, h] of Object.entries(loadHosts())) if (h.tunnel && h.port) add(name, h.port, h.tunnel.key);
+  const file = join(TUNNEL_DIR, "authorized_keys"), now = await fs.readFile(file, "utf8").catch(() => null);
+  const text = [...keys.values()].map((k) =>
+    `restrict,port-forwarding,${[...k.ports].sort((a, b) => a - b).map((p) => `permitlisten="127.0.0.1:${p}"`).join(",")} ${k.key} ssh-mcp:${[...k.names].join(",")}\n`).join("");
+  if (now !== text && (now !== null || text)) {
+    await mkdirp(TUNNEL_DIR);
+    await fs.writeFile(`${file}.new`, text, { mode: 0o644 });
+    await fs.chmod(`${file}.new`, 0o644);
+    await fs.rename(`${file}.new`, file);
+  }
+  for (const set of tunnelsOpen.values()) for (const t of set) if (!keys.has(t.blob)) t.end("its key is no longer listed");
+}
+
+// A port for a new tunnel: in TUNNEL_PORTS, not used by any host or link, and free right now.
+const portFree = (port: number) => new Promise<boolean>((res) => {
+  const s = netServer();
+  s.once("error", () => res(false));
+  s.listen(port, "127.0.0.1", () => s.close(() => res(true)));
+});
+async function tunnelPort(): Promise<number> {
+  const taken = new Set<number>();
+  for (const h of Object.values(loadHosts())) if (h.port && h.host === "127.0.0.1") taken.add(h.port);
+  for (const [, l] of await allLinks()) if (l.port && l.exp > Date.now()) taken.add(l.port);
+  for (let p = TUNNEL_PORTS[0]; p <= TUNNEL_PORTS[1]; p++) if (!taken.has(p) && (await portFree(p))) return p;
+  throw new Error(`no port is left for a tunnel in ${TUNNEL_PORTS.join("-")} (TUNNEL_PORTS)`);
+}
+
+// Where a tunnel address leads: a tunnel host, or a machine whose link is under way.
+async function tunnelTarget(id: string): Promise<{ name: string; key: string; port: number } | null> {
+  for (const [name, h] of Object.entries(loadHosts())) if (h.tunnel && h.port && sameId(h.tunnel.id, id)) return { name, key: h.tunnel.key, port: h.port };
+  for (const [, l] of await allLinks()) if (l.id && l.key && l.port && l.exp > Date.now() && sameId(l.id, id)) return { name: l.name, key: l.key, port: l.port };
+  return null;
+}
+
+// GET /t/<address> with "Upgrade: ssh-mcp-tunnel", through Caddy like everything else: after "101 Switching Protocols"
+// the connection's bytes go to and from an sshd of its own. Anything else that asks for an upgrade is refused.
+function tunnelUpgrade(req: IncomingMessage, socket: Socket, head: Buffer): void {
+  socket.on("error", () => {});
+  const no = (status: string) => { socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); };
+  const m = /^\/t\/([0-9a-f]{32})$/.exec((req.url ?? "").split("?")[0]);
+  if (TUNNEL_OFF || !m || String(req.headers.upgrade ?? "").toLowerCase() !== "ssh-mcp-tunnel") return no("404 Not Found");
+  void (async () => {
+    const to = await tunnelTarget(m[1]);
+    if (!to) return no("404 Not Found");
+    const here = tunnelsOpen.get(m[1])?.size ?? 0, all = [...tunnelsOpen.values()].reduce((n, s) => n + s.size, 0);
+    if (here >= 3 || all >= TUNNELS_MAX) {
+      console.error(`tunnel ${to.name}: refused a connection - ${here >= 3 ? `${here} of its own are open` : `${all} tunnels are open (at most ${TUNNELS_MAX})`}`);
+      return no("503 Service Unavailable");
+    }
+    const end = await tunnelReady().catch((e: Error) => { console.error(`tunnel: ${e.message}`); return null; });
+    if (!end) return no("503 Service Unavailable");
+    if (AS_ROOT) await mkdirp("/run/sshd");
+    if (socket.destroyed) return;
+    socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: ssh-mcp-tunnel\r\nConnection: Upgrade\r\n\r\n");
+    socket.setNoDelay(true);
+    socket.setKeepAlive(true, 30_000);
+    await audited(whoOf(req, "tunnel"), "tunnel", { host: to.name }, () => carryTunnel(m[1], to, end, socket, head), (e: AuditEnd) => e);
+  })().catch((e) => { console.error(e); socket.destroy(); });
+}
+
+// One tunnel connection, until it ends. sshd tells on its stderr which key logged in, which key exchange it made and
+// when the forward is listening: a login with the key of another tunnel ends it, and a machine that logs in anew
+// ends what it left open before (a connection whose network went away silently would otherwise hold its port
+// until sshd gives up on it, about 45 s).
+function carryTunnel(id: string, to: { name: string; key: string; port: number }, end: TunnelEnd, socket: Socket, head: Buffer): Promise<AuditEnd> {
+  return new Promise((done) => {
+    const child = spawn(end.sshd, ["-i", "-e", "-f", end.config], { stdio: ["pipe", "pipe", "pipe"], detached: true }); // a group of its own, ended as one
+    const set = tunnelsOpen.get(id) ?? new Set<OpenTunnel>();
+    tunnelsOpen.set(id, set);
+    const want = keyFpOf(to.key);
+    let why = "", rest = "";
+    const t: OpenTunnel = {
+      name: to.name, blob: to.key.split(" ")[1] ?? "", since: Date.now(), kex: "", in: false, up: false,
+      end(reason) {
+        if (!why) why = reason;
+        try { process.kill(-child.pid!, "SIGTERM"); } catch { /* already gone */ }
+        socket.destroy();
+        child.stdin.destroy();
+        child.stdout.destroy();
+      },
+    };
+    set.add(t);
+    child.stderr.on("data", (d: Buffer) => {
+      rest += d.toString("latin1");
+      for (let nl = rest.indexOf("\n"); nl >= 0; nl = rest.indexOf("\n")) {
+        const line = rest.slice(0, nl);
+        rest = rest.slice(nl + 1);
+        let m: RegExpExecArray | null;
+        if (!t.kex && (m = /kex: algorithm: (\S+)/.exec(line))) t.kex = m[1];
+        else if ((m = /Accepted publickey for \S+ from .* ssh2: \S+ (SHA256:[A-Za-z0-9+/]+)/.exec(line))) {
+          if (m[1] !== want) t.end("it logged in with the key of another tunnel");
+          else { t.in = true; for (const o of set) if (o !== t) o.end("the machine opened a new tunnel"); }
+        } else if ((m = /listening on 127\.0\.0\.1 port (\d+)/.exec(line)) && Number(m[1]) === to.port) t.up = true;
+        else if (!why && /(denied|refused|not allowed|Invalid user|no matching|Unable to negotiate|Connection closed by authenticating|fatal)/i.test(line))
+          why = line.replace(/^debug\d: /, "").slice(0, 240);
+      }
+      if (rest.length > 8192) rest = rest.slice(-1024);
+    });
+    child.stdin.on("error", () => {});
+    child.stdout.on("error", () => {});
+    if (head.length) child.stdin.write(head);
+    socket.pipe(child.stdin);
+    child.stdout.pipe(socket);
+    socket.on("close", () => t.end("the connection closed"));
+    child.on("error", (e) => { if (!why) why = e.message; socket.destroy(); });
+    child.on("close", () => {
+      socket.destroy();
+      set.delete(t);
+      if (!set.size && tunnelsOpen.get(id) === set) tunnelsOpen.delete(id);
+      const normal = t.in && /^(the connection closed|the machine opened a new tunnel)$/.test(why);
+      done({ ok: t.in, ...(t.kex ? { kex: t.kex } : {}), ...(normal ? {} : { err: why || "it ended before it was in" }) });
+    });
+  });
+}
+
 function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: "?" }): McpServer {
   const server = new McpServer({ name: "ssh-connector", version: VERSION }, { instructions: INSTRUCTIONS });
   // Tools are registered through `tool`, never directly: that is what puts every call in the audit log before it runs.
@@ -1378,7 +1646,13 @@ function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: 
     // v1.6: a host whose key exchange was decided says so; one that never was (written by hand, or older) reads as before
     const kex = (v: HostCfg) => v.pq === true ? (PQ_MODE === "off" ? " (classical key exchange: PQ_SSH=off)" : " (post-quantum key exchange)")
       : v.pq === false ? ` (classical key exchange${v.pqWhy ? `: ${v.pqWhy}` : ""})` : "";
-    return text(Object.entries(h).map(([k, v]) => v.local ? `${k}: (this VPS)` : `${k}: ${v.username}@${v.host}:${v.port ?? 22}${kex(v)}`).join("\n"));
+    // v1.8: a host that comes in through its own tunnel says whether that is open now, and with which key exchange
+    const tun = (id: string) => {
+      if (TUNNEL_OFF) return " (reverse tunnel: turned off on this connector, TUNNEL=off)";
+      const t = openTunnel(id);
+      return t ? ` (reverse tunnel: open, post-quantum key exchange ${t.kex || "?"})` : " (reverse tunnel: not open)";
+    };
+    return text(Object.entries(h).map(([k, v]) => v.local ? `${k}: (this VPS)` : `${k}: ${v.username}@${v.host}:${v.port ?? 22}${v.tunnel ? tun(v.tunnel.id) : kex(v)}`).join("\n"));
   });
 
   tool("ssh_exec", {
@@ -1870,22 +2144,56 @@ function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: 
     } catch (e) { return fail(e); }
   });
 
+  // v1.8: add_host with tunnel: true - a link for the machine to call on, instead of a connection to it
+  async function tunnelLink(o: { name: string; host?: string; username: string; port: number; fingerprint?: string; replace?: boolean }): Promise<string> {
+    if (o.host) throw new Error("With tunnel: true, leave host out: that server connects to this connector, not the other way round.");
+    const all = loadHosts();
+    if (all[o.name]?.local) throw new Error(`"${o.name}" is this machine itself and cannot be replaced.`);
+    if (o.name in all && !o.replace) throw new Error(`A host named "${o.name}" already exists. Pass replace: true to have the new machine take its name, or use another name.`);
+    if (!/^https:\/\/[A-Za-z0-9.-]+(:\d{1,5})?$/.test(base))
+      throw new Error(`A tunnel comes in over HTTPS, and this connector was reached at ${base || "an unknown address"}: put it behind HTTPS first (the installer does that, with Caddy), or set PUBLIC_URL.`);
+    await tunnelReady();
+    await serial(connectorKey);
+    const id = randomBytes(16).toString("hex"), exp = Date.now() + LINK_MS;
+    await serial(async () => {
+      await saveLink(id, { name: o.name, username: o.username, to: o.port, ...(o.fingerprint ? { fingerprint: o.fingerprint } : {}), ...(o.replace ? { replace: true } : {}), exp });
+      await tunnelTidy();
+    });
+    auditNote({ added: false, tunnel: true });
+    const url = `${base}/t/${id}`;
+    return [
+      `Not added yet: "${o.name}" is to connect to this connector through a tunnel of its own. On that machine, run as root:`,
+      "",
+      `  curl -fsSL ${url} | sudo bash`,
+      "",
+      `The link works once, until ${new Date(exp).toISOString().slice(11, 16)} UTC (30 minutes). To read the script first: curl -fsSL ${url}`,
+      `It checks for an OpenSSH client with a post-quantum key exchange and an SSH server on port ${o.port}, lets this connector log in as ${o.username} there, ` +
+        "and installs the service ssh-mcp-tunnel, which keeps an SSH connection open to this connector over HTTPS (port 443): nothing on that machine has to be reachable from outside. " +
+        "It needs systemd; on a machine without, SSHMCP_TUNNEL_FOREGROUND=1 keeps the tunnel in the foreground instead.",
+      `When it prints "connected", "${o.name}" can be used as host in every tool.`,
+    ].join("\n");
+  }
+
   // ── v1.5 ──
   tool("add_host", {
     description: "Connect another server to this connector, without editing hosts.json by hand. The connector has an SSH key of its own (created on first use). " +
       "If the server does not accept that key yet, the tool returns the public key line to add to the server's ~/.ssh/authorized_keys: have the user do that, then call it again. " +
       "When the login works it runs a test command, pins the server's host key and saves the host, which can be used as `host` at once. There is no password option. " +
-      "The connection to that server uses post-quantum key exchange when the server's SSH has one; the result says which it is, and why not if not.",
+      "The connection to that server uses post-quantum key exchange when the server's SSH has one; the result says which it is, and why not if not. " +
+      "For a server this connector cannot reach (behind NAT or a firewall), pass tunnel: true and leave host out: the result is a one-line command to run on that server, which then connects to this connector itself.",
     inputSchema: {
       name: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/).describe("Short name to use as `host` in the other tools, e.g. web-1"),
-      host: z.string().regex(/^[A-Za-z0-9:][A-Za-z0-9.:-]{0,252}$/).describe("IP address or DNS name of the server"),
+      host: z.string().regex(/^[A-Za-z0-9:][A-Za-z0-9.:-]{0,252}$/).optional().describe("IP address or DNS name of the server (leave it out with tunnel: true)"),
       username: z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/).describe("User to log in as, e.g. root or ubuntu"),
-      port: z.number().int().min(1).max(65535).default(22),
+      port: z.number().int().min(1).max(65535).default(22).describe("Its SSH port (with tunnel: true, the port its SSH server listens on there)"),
       fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9+/]{43}=?$/).optional().describe("Expected host key fingerprint (SHA256:...); if given, the server must present exactly this key"),
       replace: z.boolean().optional().describe("Overwrite an existing host of the same name"),
+      tunnel: z.boolean().optional().describe("The server cannot be reached from here (behind NAT or a firewall): it gets a command to run, and connects to this connector itself"),
     },
-  }, async ({ name, host, username, port, fingerprint, replace }) => {
+  }, async ({ name, host, username, port, fingerprint, replace, tunnel }) => {
     try {
+      if (tunnel) return text(await tunnelLink({ name, host, username, port, fingerprint: fingerprint?.replace(/=+$/, ""), replace }));
+      if (!host) throw new Error("host is required - or, for a server this connector cannot reach, tunnel: true");
       const target = `${username}@${host}:${port}`;
       const taken = (all: Record<string, HostCfg>) => {
         if (all[name]?.local) throw new Error(`"${name}" is this machine itself and cannot be replaced.`);
@@ -1941,14 +2249,12 @@ function buildServer(base = "", viaBridge = false, who: Who = { via: "mcp", ip: 
         who = p.who;
       }
       await serial(async () => {
-        const before = await fs.readFile(HOSTS_FILE, "utf8"), all = JSON.parse(before) as Record<string, HostCfg>;
-        taken(all);
-        all[name] = { host, port, username, privateKeyPath: key.path, hostFingerprint: hk.fp,
-          ...(pq ? { pq: true, ...(pq.via !== `127.0.0.1:${port}` ? { pqVia: pq.via } : {}) } : PQ_MODE === "off" ? {} : { pq: false, pqWhy: why }) };
-        await fs.writeFile(`${HOSTS_FILE}.bak`, before, { mode: 0o600 });
-        await fs.writeFile(`${HOSTS_FILE}.new`, `${JSON.stringify(all, null, 2)}\n`, { mode: 0o600 });
-        await fs.chmod(`${HOSTS_FILE}.new`, 0o600);
-        await fs.rename(`${HOSTS_FILE}.new`, HOSTS_FILE); // all or nothing
+        await updateHosts((all) => {
+          taken(all);
+          all[name] = { host, port, username, privateKeyPath: key.path, hostFingerprint: hk.fp,
+            ...(pq ? { pq: true, ...(pq.via !== `127.0.0.1:${port}` ? { pqVia: pq.via } : {}) } : PQ_MODE === "off" ? {} : { pq: false, pqWhy: why }) };
+        });
+        await tunnelTidy(); // a tunnel host this replaced: its tunnel's key goes
       });
       if (pq) pqKeys.set(pqKeyId(host, port, hk.fp), hk);
       auditNote({ added: true, fp: hk.fp, ...(pq ? { kex: pq.kex } : {}) });
@@ -2221,7 +2527,108 @@ bridge.post("/exec/:host", express.text({ type: () => true, limit: "1mb" }), gua
 
 app.use("/b/:token", (req, res, next) => { if (bridgeTokenOk(String(req.params.token))) next(); else res.status(404).end(); }, bridge);
 
+// ── v1.8: the tunnel links add_host hands out - the script for the machine, the machine calling in, the machine in ──
+const linkGone = "This link has run out or was used up: call add_host again.";
+const linkAnswer = (l: Link) => `port=${l.port}\nid=${l.id}\nuser=${TUNNEL_USER}\n`;
+const httpsBase = (base: string) => /^https:\/\/[A-Za-z0-9.-]+(:\d{1,5})?$/.test(base);
+// A public key line as "type base64", if it is one ssh2 can read; null otherwise.
+function publicKeyLine(line: string): string | null {
+  const [type, blob] = line.trim().split(/\s+/);
+  if (!type || !blob || !/^[A-Za-z0-9@.-]+$/.test(type) || !/^[A-Za-z0-9+/]+={0,2}$/.test(blob)) return null;
+  const parsed = sshUtils.parseKey(`${type} ${blob}`), k = Array.isArray(parsed) ? parsed[0] : parsed;
+  return k && !(k instanceof Error) && k.type === type ? `${type} ${blob}` : null;
+}
+
+// GET /t/<link>: the script to run on the machine, with its blanks filled in (any number of times, until the link is used up)
+app.get("/t/:id", guarded(async (req, res) => {
+  const id = String(req.params.id), l = await linkOf(id);
+  if (!l) return plain(res, 404, linkGone);
+  await audited(whoOf(req, "tunnel"), "tunnel.link", { host: l.name }, async (): Promise<AuditEnd> => {
+    const base = publicBase(req);
+    if (!httpsBase(base)) { plain(res, 400, `A tunnel is made over HTTPS, and this link was fetched at ${base}.`); return { ok: false, err: "not over HTTPS" }; }
+    const end = await tunnelReady(), key = await serial(connectorKey), [type, blob] = key.publicKey.split(" ");
+    const fill: Record<string, string> = {
+      __URL__: base, __ENROLL__: id, __NAME__: l.name, __USERNAME__: l.username, __SSHD_PORT__: String(l.to), __VERSION__: VERSION,
+      __CONNECTOR_KEY__: `${type} ${blob} ssh-mcp@${hostname().replace(/[^A-Za-z0-9.-]/g, "") || "connector"}`,
+      __TUNNEL_HOSTKEY__: end.hostKey, __KEX__: end.kex.join(","),
+    };
+    let script = readFileSync(new URL("./tunnel.sh", import.meta.url), "utf8");
+    for (const [k, v] of Object.entries(fill)) {
+      if (!/^[A-Za-z0-9@%+/=:,._ -]*$/.test(v)) throw new Error(`refusing to put ${JSON.stringify(v)} into a script`); // nothing that could break out of its quotes
+      script = script.replaceAll(k, v);
+    }
+    res.type("text/plain").send(script);
+    return { ok: true };
+  }, same);
+}));
+
+// POST /t/<link>: the machine calls in - its key for the tunnel and its SSH host keys - and gets the port and the
+// address of its tunnel. Once per link: the same machine asking again (a retry) gets the same answer, any other a no.
+app.post("/t/:id", express.text({ type: () => true, limit: "64kb" }), guarded(async (req, res) => {
+  const id = String(req.params.id), l0 = await linkOf(id);
+  await audited(whoOf(req, "tunnel"), "tunnel.enroll", l0 ? { host: l0.name } : {}, async (): Promise<AuditEnd> => {
+    const [status, answer] = await serial(async (): Promise<[number, string]> => { // ports, keys and records: one at a time
+      const l = await linkOf(id);
+      if (!l) return [404, linkGone];
+      const lines = (typeof req.body === "string" ? req.body : "").split("\n");
+      const field = (k: string) => lines.filter((x) => x.startsWith(`${k} `)).map((x) => x.slice(k.length + 1).trim());
+      const printable = (v?: string) => v?.replace(/[^\x20-\x7e]/g, "").slice(0, 200);
+      const key = publicKeyLine(field("key")[0] ?? "");
+      if (!key?.startsWith("ssh-ed25519 ")) return [400, "The machine sent no ssh-ed25519 key for the tunnel."];
+      const hostKeys = [...new Set(field("hostkey").map(publicKeyLine).filter((k): k is string => !!k))];
+      if (!hostKeys.length) return [400, "The machine sent none of its SSH host keys."];
+      if (l.fingerprint && !hostKeys.some((k) => keyFpOf(k) === samePin(l.fingerprint!)))
+        return [409, `None of this machine's SSH host keys has the fingerprint add_host was given (${l.fingerprint}); it has ${hostKeys.map(keyFpOf).join(", ")}. Nothing was changed.`];
+      if (l.key) return l.key === key ? [200, linkAnswer(l)] : [409, "This link was already used by another machine."];
+      const all = loadHosts(), other = Object.entries(all).find(([n, h]) => n !== l.name && h.tunnel?.key === key);
+      if (other) return [409, `This machine already comes in as "${other[0]}". To have it come in as "${l.name}" instead, remove "${other[0]}" from hosts.json first.`];
+      if (l.name in all && !l.replace) return [409, `A host named "${l.name}" was added meanwhile: call add_host again, with replace: true or another name.`];
+      Object.assign(l, { key, hostKeys, hostname: printable(field("hostname")[0]), client: printable(field("client")[0]), port: await tunnelPort(), id: randomBytes(16).toString("hex"), exp: Date.now() + LINK_MS });
+      await saveLink(id, l);
+      await tunnelTidy(); // its key, bound to its port
+      return [200, linkAnswer(l)];
+    });
+    plain(res, status, answer);
+    return status === 200 ? { ok: true } : { ok: false, err: answer };
+  }, same);
+}));
+
+// POST /t/<link>/up: the machine has started its tunnel. Once the SSH server behind it presents one of the host keys
+// the machine reported and lets the connector's key in, the host is saved - and the link is gone.
+app.post("/t/:id/up", guarded(async (req, res) => {
+  const id = String(req.params.id), l = await linkOf(id);
+  await audited(whoOf(req, "tunnel"), "tunnel.up", l ? { host: l.name } : {}, async (): Promise<AuditEnd> => {
+    const say = (status: number, msg: string): AuditEnd => { plain(res, status, msg); return status === 200 ? { ok: true } : { ok: false, err: msg }; };
+    if (!l?.key || !l.port || !l.id) return say(404, linkGone);
+    const hk = await presentedKey("127.0.0.1", l.port, l.username);
+    if ("err" in hk) return say(503, `The tunnel is not open yet (${hk.err}).`);
+    const reported = (l.hostKeys ?? []).map(keyFpOf);
+    if (!reported.includes(hk.fp)) return say(409, `The SSH server behind the tunnel presented the host key ${hk.fp}, which is not one of those this machine reported (${reported.join(", ")}). Nothing was added.`);
+    const key = await serial(connectorKey);
+    const p = await probeHost("127.0.0.1", l.port, l.username, key.privateKey, hk.fp);
+    if (!p.ok) return say(502, p.authFailed
+      ? `The tunnel is open, but the SSH server on this machine does not let the connector's key in as ${l.username}: is the line the script added to that user's ~/.ssh/authorized_keys still there, and does that server read that file?`
+      : `The tunnel is open, but the connector's login as ${l.username} did not complete: ${p.err}`);
+    const refused = await serial(async () => {
+      if (!(await linkOf(id))) return linkGone;
+      const all = loadHosts();
+      if (all[l.name]?.local || (l.name in all && !l.replace)) return `A host named "${l.name}" was added meanwhile. Nothing was added.`;
+      await updateHosts((h) => { h[l.name] = { host: "127.0.0.1", port: l.port, username: l.username, privateKeyPath: key.path, hostFingerprint: hk.fp, tunnel: { id: l.id!, key: l.key!, to: l.to } }; });
+      await fs.unlink(linkFile(id)).catch(() => {});
+      await tunnelTidy(); // what the name had before, if it was replaced, goes now
+      return "";
+    });
+    if (refused) return say(409, refused);
+    const kex = openTunnel(l.id)?.kex ?? "";
+    auditNote({ added: true, fp: hk.fp, ...(kex ? { kex } : {}) });
+    return say(200, `connected: this machine is "${l.name}" at ${publicBase(req)}, and the connector logged in through the tunnel as ${p.who}. ` +
+      `Its SSH host key ${hk.fp} is pinned; the tunnel's key exchange is ${kex ? `${kex} (post-quantum)` : "post-quantum"}.`);
+  }, same);
+}));
+
 app.use((_req, res) => { res.status(404).end(); });
 
 await auditInit();
-app.listen(PORT, "127.0.0.1", () => console.log(`ssh-mcp listening on 127.0.0.1:${PORT}`));
+const httpServer = app.listen(PORT, "127.0.0.1", () => console.log(`ssh-mcp listening on 127.0.0.1:${PORT}`));
+httpServer.on("upgrade", tunnelUpgrade); // v1.8: tunnels (everything else that asks for an upgrade is refused)
+if (!TUNNEL_OFF) void serial(tunnelTidy).catch((e) => console.error(`tunnels: ${(e as Error).message}`)); // what ran out while this was not running
