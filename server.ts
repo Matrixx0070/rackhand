@@ -467,7 +467,8 @@ chmod 700 "$D" 2>/dev/null
 `;
 
 // Shell helpers shared by all job scripts. Jobs live in $D as <jobId>.cmd/.sh/.pid/.log/.exit.
-const JOB_LIB = `${DIR_LIB}mt() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+const JOB_LIB = `${DIR_LIB}case ":$PATH:" in *:/usr/sbin:*) ;; *) PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin" ;; esac
+mt() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
 iso() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "$1"; }
 alive() { # <pid> <jobId>: is that pid still this job's wrapper (guards against pid reuse)?
   [ -n "$1" ] || return 1
@@ -2629,6 +2630,19 @@ app.post("/t/:id/up", guarded(async (req, res) => {
 app.use((_req, res) => { res.status(404).end(); });
 
 await auditInit();
-const httpServer = app.listen(PORT, "127.0.0.1", () => console.log(`rackhand listening on 127.0.0.1:${PORT}`));
+// app.listen's callback fires on success; Express 5 also calls it with the error on failure (and the
+// server emits "error"). Either way, fail loudly and exit - otherwise EADDRINUSE logs "listening", the
+// process exits 0, Restart=always loops forever with no clue, and the health check POSTs the secret to
+// whatever program already owns the port. See issue #1.
+const onListenError = (err: Error & { code?: string }) => {
+  const busy = err.code === "EADDRINUSE" ? " - another program already has that port; set PORT to a free one (e.g. PORT=8790) and restart" : "";
+  console.error(`rackhand: cannot listen on 127.0.0.1:${PORT}: ${err.message}${busy}`);
+  process.exit(1);
+};
+const httpServer = app.listen(PORT, "127.0.0.1", (err?: Error & { code?: string }) => {
+  if (err) return onListenError(err);
+  console.log(`rackhand listening on 127.0.0.1:${PORT}`);
+});
+httpServer.on("error", onListenError);
 httpServer.on("upgrade", tunnelUpgrade); // v1.8: tunnels (everything else that asks for an upgrade is refused)
 if (!TUNNEL_OFF) void serial(tunnelTidy).catch((e) => console.error(`tunnels: ${(e as Error).message}`)); // what ran out while this was not running

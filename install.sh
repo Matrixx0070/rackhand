@@ -25,14 +25,23 @@
 #   SRC=/path/to/checkout    install from a local directory instead of downloading
 #   APP=/opt/ssh-mcp SVC=ssh-mcp PORT=8787 ENVF=/etc/ssh-mcp.env STATE=/var/lib/ssh-mcp
 #                            install somewhere else / under another name (each install needs its own STATE)
+#                            Without PORT the installer uses the port of the install that is already there, else
+#                            8787 - or the next free port when another program has that one. With PORT it is
+#                            that port, or an error if another program has it.
 set -euo pipefail
 
 REPO=${REPO:-Matrixx0070/rackhand}; REF=${REF:-main}; SRC=${SRC:-}
-APP=${APP:-/opt/ssh-mcp}; SVC=${SVC:-ssh-mcp}; PORT=${PORT:-8787}; ENVF=${ENVF:-/etc/$SVC.env}
+APP=${APP:-/opt/ssh-mcp}; SVC=${SVC:-ssh-mcp}; PORT=${PORT:-}; ENVF=${ENVF:-/etc/$SVC.env}
 STATE=${STATE:-/var/lib/$SVC}   # job logs, sessions, saved output and the audit log
 NO_CADDY=${NO_CADDY:-0}; NO_FIREWALL=${NO_FIREWALL:-0}; DOMAIN=${DOMAIN:-}; PUBLIC_IP=${PUBLIC_IP:-}
 CADDYFILE=/etc/caddy/Caddyfile
 UNIT=/etc/systemd/system/$SVC.service
+# The port. PORT=... when given; else the one the installed unit already runs with, so that later runs (an
+# upgrade, a new secret) keep the port of this install instead of going back to 8787; else 8787.
+# When it was not given and another program holds it, the next free port is taken: see "the port" below.
+PORT_ASKED=$PORT
+if [ -z "$PORT" ] && [ -f "$UNIT" ]; then PORT=$(sed -n 's/^Environment=PORT=\([0-9][0-9]*\).*/\1/p' "$UNIT" 2>/dev/null | head -1) || true; fi
+PORT=${PORT:-8787}; PORT_WAS=""; PORT_WHO=""
 
 say()  { printf '>> %s\n' "$*"; }
 warn() { printf '!! %s\n' "$*" >&2; }
@@ -56,6 +65,16 @@ open_web_ports() {
 
 # The program listening on a TCP port, unless it is Caddy (which this installer shares).
 port_user() { ss -ltnpH "sport = :$1" 2>/dev/null | grep -v caddy | grep -o 'users:(("[^"]*"' | head -1 | cut -d'"' -f2 || true; }
+# Is a TCP port taken by a program other than this service? The connector of this install that already listens
+# on it (an upgrade) does not count: it is told apart by its cgroup, and is about to be restarted anyway.
+port_busy() {
+  local l p
+  l=$(ss -ltnpH "sport = :$1" 2>/dev/null || true)
+  [ -n "$l" ] || return 1
+  p=$(grep -oE 'pid=[0-9]+' <<<"$l" | head -1 | cut -d= -f2 || true)
+  if [ -n "$p" ] && grep -qs -- "/$SVC.service" "/proc/$p/cgroup"; then return 1; fi
+  return 0
+}
 
 # Put "$1" in the Caddyfile's global options block (it has to be the first block), making the block if needed.
 # An option of that name that is already there wins.
@@ -79,9 +98,10 @@ proxy_help() {
    For nginx, a file in /etc/nginx/conf.d/ (then: nginx -t && systemctl reload nginx):
 
    server {
-       listen 443 ssl;
+       listen 443 ssl;    # if your other "listen 443" blocks use "ssl http2", add http2 here too (avoids nginx -t warnings)
        server_name $DOMAIN;
-       ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;    # certbot certonly --nginx -d $DOMAIN
+       access_log off;    # the connector URL carries the secret in its path - keep it out of nginx's access log
+       ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;    # certbot certonly --nginx -d $DOMAIN  (plugin: python3-certbot-nginx; or --webroot)
        ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
        location / {
            proxy_pass http://127.0.0.1:$PORT;
@@ -109,6 +129,20 @@ EOF
 command -v systemctl >/dev/null && [ -d /run/systemd/system ] || die "systemd is required"
 for c in curl tar; do command -v $c >/dev/null || die "$c is required (install it and run again)"; done
 case "$(uname -m)" in x86_64|amd64) NARCH=x64; CARCH=amd64;; aarch64|arm64) NARCH=arm64; CARCH=arm64;; *) die "unsupported CPU: $(uname -m)";; esac
+
+# ---------- the port ----------
+# Never start on a port that another program holds: the connector could not listen there, and the health check
+# further down would send the secret to that program (issue #1). A port given with PORT= is used as it is or not
+# at all. Otherwise the next free one is taken, so the one-line install also goes through on a machine where
+# 8787 already belongs to something else - before anything on this machine has been changed.
+if port_busy "$PORT"; then
+  PORT_WHO=$(port_user "$PORT"); PORT_WHO=${PORT_WHO:-another program}
+  [ -z "$PORT_ASKED" ] || die "port $PORT is already used by '$PORT_WHO' - give a free one, or leave PORT out and the installer picks one"
+  PORT_WAS=$PORT
+  for _ in $(seq 1 100); do PORT=$((PORT + 1)); port_busy "$PORT" || break; done
+  if port_busy "$PORT"; then die "ports $PORT_WAS to $PORT are all in use - run again with PORT=<a free port>"; fi
+  say "port $PORT_WAS is used by '$PORT_WHO' (left as it is): the connector will use port $PORT"
+fi
 
 # ---------- 1. Node.js ----------
 node_ok() { command -v node >/dev/null 2>&1 && [ "$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)" -ge 20 ]; }
@@ -181,7 +215,7 @@ Environment=HOSTS_FILE=$APP/hosts.json
 Environment=PORT=$PORT
 Environment=JOBS_DIR=$STATE/jobs
 Environment="HOME=$RUN_HOME"
-Environment="PATH=$APP/node_modules/.bin:$(dirname "$NODE"):/usr/local/bin:/usr/bin:/bin"
+Environment="PATH=$APP/node_modules/.bin:$(dirname "$NODE"):/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 ExecStart=$NODE --import tsx server.ts
 Restart=always
 RestartSec=1
@@ -197,6 +231,7 @@ systemctl restart "$SVC"
 
 URL_LOCAL="http://127.0.0.1:$PORT/mcp/$MCP_SECRET"
 tool_count() {
+  if port_busy "$PORT"; then echo 0; return 0; fi   # another program got the port meanwhile: it must not be sent the secret
   curl -s -m 5 -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$URL_LOCAL" 2>/dev/null | grep -o '"name":"[a-z_]*"' | wc -l
 }
@@ -208,9 +243,9 @@ else
   if [ -n "$BAK" ]; then
     warn "the new server did not answer - putting the previous server.ts back"
     cp -pf "$BAK" "$APP/server.ts"; systemctl restart "$SVC"
-    N=$(wait_up) && die "upgrade failed; the previous version is running again ($N tools)" || die "upgrade failed and the previous version does not answer either - see: journalctl -u $SVC"
+    N=$(wait_up) && die "upgrade failed; the previous version is running again ($N tools)" || die "upgrade failed and the previous version does not answer either on port $PORT - see: journalctl -u $SVC"
   fi
-  die "the server did not start - see: journalctl -u $SVC"
+  die "the server did not start on port $PORT - see: journalctl -u $SVC"
 fi
 
 # ---------- 5. HTTPS ----------
@@ -242,11 +277,12 @@ else
     fi
     mkdir -p /etc/caddy /var/lib/caddy
     MARK="# ssh-mcp ($SVC)"
-    if [ -f "$CADDYFILE" ] && grep -qF "$MARK" "$CADDYFILE" && { [ -z "$BUSY80" ] || our_site | grep -q disable_http_challenge; }; then
+    if [ -f "$CADDYFILE" ] && grep -qF "$MARK" "$CADDYFILE" && our_site | grep -qE "reverse_proxy 127\.0\.0\.1:$PORT\$" \
+       && { [ -z "$BUSY80" ] || our_site | grep -q disable_http_challenge; }; then
       say "Caddyfile already has the $SVC site"
     else
       [ -f "$CADDYFILE" ] && cp -p "$CADDYFILE" "$CADDYFILE.bak-$TS"       # other sites in it are left as they are
-      if [ -f "$CADDYFILE" ] && grep -qF "$MARK" "$CADDYFILE"; then        # our own older site, written before port 80 was taken
+      if [ -f "$CADDYFILE" ] && grep -qF "$MARK" "$CADDYFILE"; then        # our own older site: written before port 80 was taken, or for another port
         awk -v m="$MARK" '$0 == m {skip = 1; next} skip && /^}$/ {skip = 0; next} !skip' "$CADDYFILE" > "$CADDYFILE.new"
         cat "$CADDYFILE.new" > "$CADDYFILE" && rm -f "$CADDYFILE.new"
       fi
@@ -304,11 +340,20 @@ case "$ROLE" in *"<"*|*" "*) ROLE="";; esac
 echo
 echo "=================================================================="
 if [ -n "$DOMAIN" ] && [ "$NO_CADDY" != 1 ]; then
-  echo " CONNECTOR URL - whoever has it has a root shell on this machine:"
-  echo
-  echo "   https://$DOMAIN/mcp/$MCP_SECRET"
-  echo
-  [ "$HTTPS_OK" = 1 ] && echo " HTTPS check: OK" || echo " HTTPS check: NOT reachable yet (see the warning above)"
+  if [ "$HTTPS_OK" = 1 ]; then
+    echo " CONNECTOR URL - whoever has it has a root shell on this machine (do not paste it anywhere):"
+    echo
+    echo "   https://$DOMAIN/mcp/$MCP_SECRET"
+    echo
+    echo " HTTPS check: OK"
+  else
+    # HTTPS is not up yet, and this whole output is what people paste when asking for help - so keep the
+    # secret out of it and print a command that shows the URL on demand instead.
+    echo " HTTPS check: NOT reachable yet (see the warning above)."
+    echo " The connector URL carries a secret, so it is not printed here. Once HTTPS works, show it with:"
+    echo "   echo \"https://$DOMAIN/mcp/\$(sed -n 's/^MCP_SECRET=//p' $ENVF)\""
+    echo " (whoever has that URL has a root shell on this machine - do not paste it anywhere.)"
+  fi
 else
   echo " Local endpoint (put HTTPS in front of it):"
   echo "   $URL_LOCAL"
@@ -317,6 +362,7 @@ echo "=================================================================="
 echo " Add it as a custom connector / remote MCP server in your AI client (see README)."
 echo " More SSH hosts:  ask the assistant to add one (the add_host tool), or edit $APP/hosts.json"
 echo " Logs:            journalctl -u $SVC -f"
+[ -n "$PORT_WAS" ] && echo " Local port:      $PORT, because $PORT_WAS belongs to '$PORT_WHO' (later runs of this installer keep $PORT)"
 AUDIT=$(journalctl -u "$SVC" -n 50 --no-pager -o cat 2>/dev/null | sed -n 's/^audit log: //p' | tail -1 || true)
 [ -n "$AUDIT" ] && echo " Audit log:       $AUDIT   (every call the connector runs)"
 echo " New secret:      delete $ENVF, run this installer again, re-add the connector"

@@ -76,9 +76,10 @@ The installer never changes a program that already holds one of these ports.
 
 ```nginx
 server {
-    listen 443 ssl;
+    listen 443 ssl;    # if your other "listen 443" blocks use "ssl http2", add http2 here too (avoids nginx -t warnings)
     server_name 203-0-113-10.sslip.io;
-    ssl_certificate     /etc/letsencrypt/live/203-0-113-10.sslip.io/fullchain.pem;    # certbot certonly --nginx -d 203-0-113-10.sslip.io
+    access_log off;    # the connector URL carries the secret in its path - keep it out of nginx's access log
+    ssl_certificate     /etc/letsencrypt/live/203-0-113-10.sslip.io/fullchain.pem;    # certbot certonly --nginx -d 203-0-113-10.sslip.io  (plugin: python3-certbot-nginx; or --webroot)
     ssl_certificate_key /etc/letsencrypt/live/203-0-113-10.sslip.io/privkey.pem;
     location / {
         proxy_pass http://127.0.0.1:8787;
