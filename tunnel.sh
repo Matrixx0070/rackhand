@@ -182,6 +182,13 @@ EOF
   fi
 
   # 4. the service
+  # It starts ssh through env, not as ssh itself. On a machine with SELinux enforcing (RHEL, Fedora, ...) a unit
+  # whose program is the ssh client stays in systemd's own domain (init_t), which may neither run ssh - the unit
+  # fails with status=203/EXEC and loops, and that denial is not even logged - nor connect to the SSH server on
+  # port 22, so the tunnel would come up and pass nothing. Started through env, it gets the domain that every
+  # other third-party service runs in (unconfined_service_t). Without SELinux it makes no difference.
+  local env_bin
+  env_bin=$(command -v env || echo /usr/bin/env)
   cat > "$unit" <<EOF
 [Unit]
 Description=Rackhand tunnel to $url (as "$name")
@@ -191,7 +198,7 @@ Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
-ExecStart=$ssh_bin -F $dir/ssh_config -N -T ssh-mcp-tunnel
+ExecStart=$env_bin $ssh_bin -F $dir/ssh_config -N -T ssh-mcp-tunnel
 Restart=always
 RestartSec=5
 ProtectSystem=strict
